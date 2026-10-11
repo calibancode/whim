@@ -1,0 +1,51 @@
+# Python / tooling
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Credentials and secrets (whim keeps its own outside the repo; never commit any)
+credentials.json
+*.credentials.json
+.env
+.env.*
+*.key
+*.pem
+
+# Runtime state: a whim home (config, ledger, workspace, socket) must not live in the repo
+config.toml
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sock
+whim.lock
+*.log
+run/
+workspace/
+
+# Character memory and identity files written by a running character
+IDENTITY.md
+SOUL.md
+USER.md
+MEMORY.md
+BOOTSTRAP.md
+memory/
+journal/
