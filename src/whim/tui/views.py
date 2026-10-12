@@ -175,10 +175,15 @@ class JournalScreen(FileReader):
 
 
 class MemoryScreen(FileReader):
+    """The character's own documents: the character files first, then any other notes it
+    keeps as text. The journal has its own view; a plugin's folder (it has plugin.json)
+    is code, and anything else that isn't a text document is the workspace's business."""
+
     VIEW = "memory"
-    EMPTY = "The workspace is empty."
+    EMPTY = "No memory documents yet."
     HINT = "↑↓ choose a file · e open in your editor · r reload · esc back"
     BINDINGS = [Binding("r", "reload", "Reload", show=False), Binding("e", "edit", "Edit", show=False)]
+    DOCUMENTS = (".md", ".markdown", ".txt")
 
     def files(self) -> list[tuple[str, str]]:
         found: list[str] = []
@@ -188,11 +193,13 @@ class MemoryScreen(FileReader):
                 entries = safefs.listdir(self.workspace, rel)
             except (OSError, safefs.UnsafePath):
                 return
+            if rel and ("plugin.json", "file") in entries:
+                return
             for name, kind in entries:
                 path = f"{rel}/{name}" if rel else name
                 if name.startswith(".") or path == "journal" or len(found) >= 300:
                     continue
-                if kind == "file":
+                if kind == "file" and name.lower().endswith(self.DOCUMENTS):
                     found.append(path)
                 elif kind == "dir" and depth < 3:
                     walk(path, depth + 1)

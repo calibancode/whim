@@ -95,7 +95,7 @@ composer and the status line shows `⚑ waiting`. **ctrl+o** opens the oldest on
 | key | view |
 | --- | --- |
 | f2 | **Journal**: the character's dated entries |
-| f3 | **Memory**: IDENTITY, SOUL, USER, MEMORY and other workspace files; `e` opens one in `$VISUAL`/`$EDITOR` |
+| f3 | **Memory**: IDENTITY, SOUL, USER, MEMORY and the character's other notes (`.md`, `.txt`; not the journal or plugin folders); `e` opens one in `$VISUAL`/`$EDITOR` |
 | f4 | **Schedule**: next heartbeat, standing cues, scheduled jobs, recent wakes of its own |
 | f5 | **Activity**: every run with its tool calls, results, errors, private text and token use, plus host events (wakes, compaction, shell sessions, warnings); `f` filters |
 | f6 | **Administration**: status; stop, interrupt, wake and restart; pending approvals and questions; access, grants and settings |

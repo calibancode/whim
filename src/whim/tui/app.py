@@ -439,10 +439,11 @@ class Modal(ModalScreen):
         width: 90; max-width: 100%; height: auto; max-height: 90%;
         border: round $accent; background: $surface; padding: 1 2;
     }
-    Modal #dialog-body { height: auto; max-height: 30; }
-    Modal .buttons { height: auto; margin-top: 1; align-horizontal: right; }
+    Modal #dialog-body { height: auto; max-height: 1fr; }
+    Modal .buttons { dock: bottom; height: auto; margin-top: 1; align-horizontal: right; }
     Modal .buttons Button { margin-left: 1; min-width: 10; }
-    Modal .choice { height: 1; border: none; min-width: 0; width: auto; margin: 0 0 1 0; padding: 0 2; }
+    Modal .choice { height: auto; border: none !important; min-width: 0; width: auto; max-width: 100%; text-wrap: wrap; text-align: left; content-align-horizontal: left;
+                    margin: 0 0 1 0; padding: 0 2; }
     Modal .warning { color: $error; text-style: bold; }
     """
     BINDINGS = [Binding("escape", "dismiss_modal", "Close", show=False)]
@@ -471,6 +472,15 @@ class ConfirmScreen(Modal):
     @on(Button.Pressed)
     def pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "ok")
+
+
+def standing_note(scopes: list[str]) -> str:
+    """What the standing choice adds, and what it doesn't (see whim.authz.STANDING)."""
+    extra = [s for s in scopes if s != "plugin.run"]
+    this = f"{', '.join(extra)} {'is' if len(extra) == 1 else 'are'} approved for this version only, and " if extra else ""
+    return ("Also adds a standing plugin.run grant: from now on any plugin, or new version of one, runs in "
+            f"the sandbox without asking. It covers nothing more: {this}every plugin still has to ask for net, "
+            "workspace or any other permission. Revocable in Admin (f6).")
 
 
 class ApprovalScreen(Modal):
@@ -504,8 +514,8 @@ class ApprovalScreen(Modal):
                     meta.append(f"\nasked {stamp(parse_at(a['created_at']))} · {a.get('id', '')}", style="dim")
                 yield Static(meta)
                 if "plugin.run" in self.scopes:
-                    yield Checkbox("Also let future plugins run sandboxed without asking "
-                                   "(extra permissions still ask)", id="standing")
+                    yield Checkbox("Let any plugin run sandboxed", id="standing")
+                    yield Static(Text(standing_note(self.scopes), style="dim"), classes="note")
             with Horizontal(classes="buttons"):
                 yield Button("Later", id="later")
                 yield Button("Deny", id="deny", variant="error")
