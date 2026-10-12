@@ -13,13 +13,13 @@ Requires Linux, Python 3.12+, and a [DeepSeek API key](https://platform.deepseek
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e '.[tui]'   # or `pip install -e .` without the terminal UI
 
 whim init
 whim auth set
 ```
 
-Start the daemon with `whim run`, then open another terminal and run `whim chat`.
+Start the daemon with `whim run`, then open another terminal and run `whim tui` ([the terminal interface](docs/tui.md)), or `whim chat` for a plain line-based chat.
 
 See `whim --help` for available commands, [administration](docs/administration.md) for access, settings and restarts, and [the client protocol](docs/client_protocol.md) for writing your own interface.
 

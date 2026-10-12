@@ -1,4 +1,4 @@
-"""whim command line: init | run | chat | send | wake | events | status | config | access | restart | ..."""
+"""whim command line: init | run | chat | tui | send | wake | events | status | config | access | restart | ..."""
 
 from __future__ import annotations
 
@@ -32,11 +32,13 @@ OVERSIZED = {"type": "whim.client.oversized"}  # stands in for a frame larger th
 
 
 class Client:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, read_timeout: float | None = None):
+        """`read_timeout` bounds the wait for each response (not event streams); past it
+        the outcome is unknown, like any failure after connecting."""
         self.cfg = cfg
         self.session = aiohttp.ClientSession(
             connector=aiohttp.UnixConnector(path=str(cfg.socket_path)),
-            timeout=aiohttp.ClientTimeout(total=None, sock_connect=5),
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=read_timeout),
         )
 
     async def __aenter__(self) -> "Client":
@@ -500,6 +502,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--no-heartbeat", action="store_true", help="disable heartbeats for this session")
     p = sub.add_parser("chat", help="talk with the character")
     p.add_argument("--activity", action="store_true", help="also show runs, tools and authored text")
+    p = sub.add_parser("tui", help="full-screen terminal interface (needs the `tui` extra)")
+    p.add_argument("--name", default=None, help="what to call the character (default: from its IDENTITY.md)")
     p = sub.add_parser("send", help="send one message")
     p.add_argument("text")
     p.add_argument("--next-run", action="store_true", help="hold it until the character's current wake ends")
@@ -616,6 +620,12 @@ def main(argv: list[str] | None = None) -> None:
         else:
             for line in service.uninstall():
                 print(line)
+        return
+
+    if args.cmd == "tui":  # waits for the daemon itself when it isn't running yet
+        from whim import tui
+
+        tui.main(cfg, args.name)
         return
 
     if not cfg.socket_path.exists():
