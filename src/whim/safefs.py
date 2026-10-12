@@ -137,12 +137,21 @@ def kind(root: Path, rel: str) -> str:
     return "other"
 
 
-def write_atomic(root: Path, rel: str, data: bytes, *, mode: int = 0o644) -> None:
+def write_atomic(root: Path, rel: str, data: bytes, *, mode: int | None = None) -> None:
+    """Replace (or create) a file. An existing file keeps its permission bits (an
+    executable script stays executable); a new one gets `mode`, default 0644."""
     with parent(root, rel, create=True) as (dfd, name):
+        if mode is None:
+            try:
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                mode = stat.S_IMODE(st.st_mode) if stat.S_ISREG(st.st_mode) else 0o644
+            except FileNotFoundError:
+                mode = 0o644
         tmp = f".{name}.{secrets.token_hex(8)}.whim-tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=dfd)
         try:
             with os.fdopen(fd, "wb") as f:
+                os.fchmod(f.fileno(), mode)  # not subject to the umask
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())

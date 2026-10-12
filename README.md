@@ -21,7 +21,7 @@ whim auth set
 
 Start the daemon with `whim run`, then open another terminal and run `whim chat`.
 
-See `whim --help` for available commands and [the client protocol](docs/client_protocol.md) for writing your own interface.
+See `whim --help` for available commands, [administration](docs/administration.md) for access, settings and restarts, and [the client protocol](docs/client_protocol.md) for writing your own interface.
 
 ## License
 

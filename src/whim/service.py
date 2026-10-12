@@ -5,6 +5,8 @@ systemd supervises the process; whim has no watchdog of its own. The unit:
   (so it uses the same owner-only credentials file and the same character state);
 - restarts on failure, but not when another daemon already owns the home (exit 75) or
   the configuration/credentials are unusable (exit 78), which restarting can't fix;
+- restarts on EXIT_RESTART (76), which whim uses for its own checked restarts
+  (whim.restart); WHIM_SUPERVISOR tells whim it is supervised and may do that;
 - gives a stop request longer than whim's own shutdown grace, so a run in progress can
   finish; anything still active is reconciled at the next start like any crash.
 The home's flock still guarantees one daemon even if a foreground `whim run` is started
@@ -20,6 +22,7 @@ import sys
 from pathlib import Path
 
 from whim.config import Config
+from whim.restart import EXIT_RESTART
 
 EXIT_ALREADY_RUNNING = 75  # EX_TEMPFAIL
 EXIT_CONFIG = 78  # EX_CONFIG
@@ -46,11 +49,13 @@ ExecStart={exec_start}
 Restart=on-failure
 RestartSec=10
 RestartPreventExitStatus={EXIT_ALREADY_RUNNING} {EXIT_CONFIG}
+RestartForceExitStatus={EXIT_RESTART}
 # whim drains a running wake for up to shutdown_grace_seconds on SIGTERM.
 TimeoutStopSec={stop_timeout}
 KillMode=mixed
 UMask=0077
 Environment=PYTHONUNBUFFERED=1
+Environment=WHIM_SUPERVISOR=systemd
 
 [Install]
 WantedBy=default.target

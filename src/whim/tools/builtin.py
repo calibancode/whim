@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from whim import (
+    access,
     authz,
     bootstrap,
     cron,
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from whim.run import RunState
 
 MAX_READ_BYTES = 256 * 1024
+MAX_SLICED_FILE_BYTES = 64 * 1024 * 1024  # files read by line range
 MAX_WRITE_BYTES = 256 * 1024
 
 
@@ -63,13 +65,24 @@ class HeartbeatManageArgs(_Args):
 
 
 class ReadArgs(_Args):
-    path: str = Field(description='Path relative to your workspace, e.g. MEMORY.md or notes/ideas.md. '
+    path: str = Field(description='A path relative to your workspace (e.g. MEMORY.md, notes/ideas.md), or an '
+                                  'absolute path inside a folder you have access to (host_access lists them). '
                                   'A folder (e.g. "journal", or "." for the top) returns its listing.')
+    offset: int | None = Field(default=None, ge=1, description="Optional: first line to return (1-based).")
+    limit: int | None = Field(default=None, ge=1, description="Optional: how many lines to return.")
 
 
 class WriteArgs(_Args):
-    path: str = Field(description="Path relative to your workspace. Parent folders are created.")
+    path: str = Field(description="Path relative to your workspace, or an absolute path in a folder you may "
+                                  "write. Parent folders are created.")
     content: str = Field(description="The complete new file content (replaces the file).")
+
+
+class EditArgs(_Args):
+    path: str = Field(description="Same paths as file_write.")
+    old: str = Field(description="Exact text to replace; it must occur exactly once unless all is true.")
+    new: str = Field(description="Replacement text.")
+    all: bool = Field(default=False, description="Replace every occurrence.")
 
 
 def workspace_path(workspace: Path, rel: str) -> Path:
@@ -91,45 +104,108 @@ async def _send(state: "RunState", args: SendArgs) -> ToolResult:
     return ToolResult(receipt["status"] == "sent", receipt)
 
 
+def _locate(h, raw: str, *, write: bool = False) -> tuple[access.Root, str]:
+    root, rel = access.resolve(h, raw, write=write)
+    return root, "/".join(safefs.parts(rel))
+
+
 async def _read(state: "RunState", args: ReadArgs) -> ToolResult:
-    ws = state.harness.cfg.workspace
     try:
-        rel = "/".join(safefs.parts(args.path))
-        if not rel or safefs.kind(ws, rel) == "dir":
-            entries = [n + ("/" if k == "dir" else "") for n, k in safefs.listdir(ws, rel) if k != "other"]
+        root, rel = _locate(state.harness, args.path)
+        if not rel or safefs.kind(root.path, rel) == "dir":
+            entries = [n + ("/" if k == "dir" else "") for n, k in safefs.listdir(root.path, rel) if k != "other"]
+            if len(entries) > 1000:
+                return ToolResult(True, {"path": args.path, "entries": entries[:1000], "truncated": True})
             return ToolResult(True, {"path": args.path, "entries": entries})
-        data = safefs.read_bytes(ws, rel, limit=MAX_READ_BYTES)
+        sliced = args.offset is not None or args.limit is not None
+        data = safefs.read_bytes(root.path, rel, limit=MAX_SLICED_FILE_BYTES if sliced else MAX_READ_BYTES)
     except (PermissionError, FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
         return ToolResult(False, {"error": _fs_error(args.path, e)})
+    if sliced:
+        if len(data) > MAX_SLICED_FILE_BYTES:
+            return ToolResult(False, {"error": f"{args.path} is too large to read by lines; use a shell command"})
+        lines = data.decode("utf-8", errors="replace").splitlines(keepends=True)
+        start = (args.offset or 1) - 1
+        chunk = lines[start:start + (args.limit or len(lines))]
+        text = "".join(chunk)
+        truncated = len(text.encode()) > MAX_READ_BYTES
+        out = {"path": args.path, "content": text[:MAX_READ_BYTES], "first_line": start + 1,
+               "lines": len(chunk), "total_lines": len(lines)}
+        return ToolResult(True, {**out, "truncated": True} if truncated else out)
     truncated = len(data) > MAX_READ_BYTES
     text = data[:MAX_READ_BYTES].decode("utf-8", errors="replace")
-    return ToolResult(True, {"path": args.path, "content": text, "truncated": truncated})
+    out = {"path": args.path, "content": text, "truncated": truncated}
+    if truncated:
+        out["note"] = "use offset and limit (lines) to read the rest"
+    return ToolResult(True, out)
 
 
 def _fs_error(path: str, e: Exception) -> str:
     if isinstance(e, FileNotFoundError):
         return f"{path} doesn't exist"
+    if isinstance(e, access.AccessError):
+        return str(e)
     if isinstance(e, safefs.UnsafePath):
-        return f"{path}: {e} (only regular files and folders inside your workspace can be used)"
+        return f"{path}: {e} (only regular files and folders, not symbolic links, can be used)"
     return f"{path}: {type(e).__name__}"
+
+
+def _write_file(h, raw: str, data: bytes) -> tuple[ToolResult | None, list[str], access.Root | None]:
+    """Shared checks and the write itself; returns (error result or None, parts, root)."""
+    if len(data) > MAX_WRITE_BYTES:
+        return ToolResult(False, {"error": f"content exceeds {MAX_WRITE_BYTES} bytes"}), [], None
+    try:
+        root, rel = _locate(h, raw, write=True)
+        p = safefs.parts(rel)
+        if root.kind == "workspace":
+            if p == [bootstrap.FILE]:
+                return ToolResult(False, {"error": f"{bootstrap.FILE} is managed by the host"}), p, root
+            if p and p[0] == journal.DIR:
+                return ToolResult(False, {"error": "journal files are append-only; use journal_write"}), p, root
+        safefs.write_atomic(root.path, "/".join(p), data)
+    except (PermissionError, FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
+        return ToolResult(False, {"error": _fs_error(raw, e)}), [], None
+    return None, p, root
+
+
+def _acks(root, p: list[str], data: bytes) -> dict | None:
+    if root.kind != "workspace":
+        return None
+    return {name: hashlib.sha256(data).hexdigest() for name in CHARACTER_FILES if p == [name]} or None
 
 
 async def _write(state: "RunState", args: WriteArgs) -> ToolResult:
     data = args.content.encode()
-    if len(data) > MAX_WRITE_BYTES:
-        return ToolResult(False, {"error": f"content exceeds {MAX_WRITE_BYTES} bytes"})
-    ws = state.harness.cfg.workspace
+    err, p, root = _write_file(state.harness, args.path, data)
+    if err is not None:
+        return err
+    return ToolResult(True, {"path": args.path, "bytes": len(data)}, file_acks=_acks(root, p, data))
+
+
+async def _edit(state: "RunState", args: EditArgs) -> ToolResult:
+    h = state.harness
     try:
-        p = safefs.parts(args.path)
-        if p == [bootstrap.FILE]:
-            return ToolResult(False, {"error": f"{bootstrap.FILE} is managed by the host"})
-        if p and p[0] == journal.DIR:
-            return ToolResult(False, {"error": "journal files are append-only; use journal_write"})
-        safefs.write_atomic(ws, "/".join(p), data)
+        root, rel = _locate(h, args.path, write=True)
+        raw = safefs.read_bytes(root.path, rel, limit=MAX_WRITE_BYTES)
     except (PermissionError, FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
         return ToolResult(False, {"error": _fs_error(args.path, e)})
-    acks = {name: hashlib.sha256(data).hexdigest() for name in CHARACTER_FILES if p == [name]}
-    return ToolResult(True, {"path": args.path, "bytes": len(data)}, file_acks=acks or None)
+    if len(raw) > MAX_WRITE_BYTES:
+        return ToolResult(False, {"error": f"{args.path} is larger than {MAX_WRITE_BYTES} bytes; edit it with a "
+                                           "shell command instead"})
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return ToolResult(False, {"error": f"{args.path} is not UTF-8 text"})
+    n = text.count(args.old) if args.old else 0
+    if n == 0:
+        return ToolResult(False, {"error": "old text not found (it must match exactly, including whitespace)"})
+    if n > 1 and not args.all:
+        return ToolResult(False, {"error": f"old text occurs {n} times; include more context or set all"})
+    data = text.replace(args.old, args.new).encode()
+    err, p, root = _write_file(h, args.path, data)
+    if err is not None:
+        return err
+    return ToolResult(True, {"path": args.path, "replaced": n, "bytes": len(data)}, file_acks=_acks(root, p, data))
 
 
 def _bootstrap_complete(state: "RunState", args: BootstrapCompleteArgs, operation_id: str) -> ToolResult:
@@ -327,7 +403,7 @@ def register_builtins(reg: Registry, deliveries: Deliveries, timezone: str = "UT
     reg.register(
         Tool(
             name="file.read",
-            description="Read a text file from your workspace, or list a folder.",
+            description="Read a text file (whole, or a range of lines), or list a folder.",
             params=ReadArgs,
             effect="read",
             impl="whim.builtin.file_read@1",
@@ -338,11 +414,21 @@ def register_builtins(reg: Registry, deliveries: Deliveries, timezone: str = "UT
     reg.register(
         Tool(
             name="file.write",
-            description="Create or replace a text file in your workspace.",
+            description="Create or replace a text file.",
             params=WriteArgs,
             effect="write",
             impl="whim.builtin.file_write@1",
             handler=_write,
+        )
+    )
+    reg.register(
+        Tool(
+            name="file.edit",
+            description="Replace exact text in a file (safer than rewriting a whole file).",
+            params=EditArgs,
+            effect="write",
+            impl="whim.builtin.file_edit@1",
+            handler=_edit,
         )
     )
     reg.register(

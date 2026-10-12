@@ -25,7 +25,9 @@ from whim.ledger import dumps, new_id
 if TYPE_CHECKING:
     from whim.harness import Harness
 
-SCOPES = ("plugin.run", "net", "workspace.read", "workspace.write")
+SCOPES = ("plugin.run", "net", "workspace.read", "workspace.write",
+          "fs.read", "fs.write", "fs.tool", "shell.run", "shell.net",  # see whim.access
+          "config.write")  # one proposed settings change; see whim.settings
 STANDING = ("plugin.run",)
 
 SCHEMA = """
@@ -115,6 +117,18 @@ def decide(h: "Harness", approval_id: str, approve: bool, principal_id: str, *, 
                                     "scopes": scopes, "standing": standing_scopes}, actor="human", audience="human",
                origin={"kind": "control", "principal_id": principal_id})
     return dict(led.q1("SELECT * FROM approvals WHERE id = ?", approval_id))
+
+
+def grant(h: "Harness", subject: str, scope: str, principal_id: str) -> dict:
+    """A grant the designated human gives directly, without a pending request. Inside a tx."""
+    if principal_id != h.cfg.principal_id:
+        raise AuthzError("only the designated human can grant access")
+    gid = new_id("grt")
+    h.ledger.x("INSERT INTO grants(id, subject, scope, approval_id, granted_by, created_at) VALUES(?, ?, ?, NULL, ?, ?)",
+               gid, subject, scope, principal_id, h.time.iso())
+    h.ledger.append("grant.created", {"grant_id": gid, "subject": subject, "scope": scope}, actor="human",
+                    audience="human", origin={"kind": "control", "principal_id": principal_id})
+    return dict(h.ledger.q1("SELECT * FROM grants WHERE id = ?", gid))
 
 
 def revoke(h: "Harness", grant_id: str, principal_id: str) -> dict:

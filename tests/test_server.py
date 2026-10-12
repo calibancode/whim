@@ -132,3 +132,33 @@ async def test_wake_endpoint_queues_host_wake(rig):
     await h.wait_idle()
     [run] = h.ledger.q("SELECT origin FROM runs")
     assert json.loads(run["origin"])["kind"] == "host"
+
+
+async def test_access_config_and_restart_endpoints(rig, tmp_path, monkeypatch):
+    monkeypatch.delenv("WHIM_SUPERVISOR", raising=False)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    h = await rig.start()
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    async with served(h) as c:
+        out = await c.post("/v1/access", {"action": "grant", "target": str(proj), "write": True})
+        assert {"path": str(proj), "access": "read-write", "kind": "granted"} in out["roots"]
+        status, err = await c.try_post("/v1/access", {"action": "grant", "target": str(h.cfg.home)})
+        assert status == 400 and "never shared" in err["error"]
+        bin_ = proj / "bin"
+        bin_.mkdir()
+        monkeypatch.setenv("PATH", f"{bin_}:/usr/bin")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        status, err = await c.try_post("/v1/access", {"action": "grant", "target": str(bin_), "write": True})
+        assert status == 409 and any("outside the sandbox" in w for w in err["warnings"])
+        await c.post("/v1/access", {"action": "grant", "target": str(bin_), "write": True, "confirm": True})
+        out = await c.post("/v1/access", {"action": "revoke", "target": str(proj), "write": True})
+        assert {"path": str(proj), "access": "read-only", "kind": "granted"} in (await c.get("/v1/access"))["roots"]
+        out = await c.post("/v1/config", {"changes": {"heartbeat.enabled": "false", "provider.model": "m2"}})
+        assert out["applied_now"] == ["heartbeat.enabled"] and out["saved_waiting_for_restart"] == ["provider.model"]
+        assert h.heartbeats_enabled is False
+        assert (await c.get("/v1/config"))["waiting_for_restart"] == ["provider.model"]
+        status, err = await c.try_post("/v1/config", {"changes": {"exec.max_sessions": 0}})
+        assert status == 400
+        status, err = await c.try_post("/v1/restart", {"reason": "test"})
+        assert status == 409 and "systemd" in err["error"]

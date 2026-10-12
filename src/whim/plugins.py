@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 NAME_RE = re.compile(r"^[a-z][a-z0-9]{1,23}$")
 TOOL_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 RESERVED = {"message", "turn", "file", "journal", "cron", "heartbeat", "history", "bootstrap", "plugin", "tool",
-            "whim", "host", "system", "human", "question"}
+            "whim", "host", "system", "human", "question", "shell", "access", "config"}
 MAX_FILES, MAX_BYTES, MAX_TOOLS = 50, 1024 * 1024, 20
 NATIVE_DESCRIPTION_CHARS = 300
 VALIDATION_LIMITS = sandbox.Limits(seconds=15, memory_bytes=768 * 1024 * 1024)

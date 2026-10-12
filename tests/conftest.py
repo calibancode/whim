@@ -57,6 +57,9 @@ def isolated_credentials(request, tmp_path_factory, monkeypatch):
 def cfg(tmp_path: Path):
     c, _ = onboard.init(tmp_path / "home")
     c.timezone = "America/Los_Angeles"  # deterministic local times and DST behaviour
+    from whim import settings
+
+    settings.save(c, {"character.timezone": c.timezone})  # saved too, so the running and saved configurations agree
     return c
 
 

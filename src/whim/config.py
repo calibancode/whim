@@ -73,6 +73,25 @@ class PluginsConfig:
 
 
 @dataclass
+class ExecConfig:
+    """Shell commands the character runs under bubblewrap (see whim.shell)."""
+
+    enabled: bool = True
+    shell: str = "/bin/bash"  # must be under /usr or /bin (visible inside the sandbox)
+    default_timeout_seconds: float = 120.0
+    max_timeout_seconds: float = 3600.0
+    max_sessions: int = 8
+    output_buffer_bytes: int = 1024 * 1024  # retained per session; older output is dropped
+    memory_mb: int = 4096  # data-segment limit per process
+    file_size_mb: int = 1024
+
+
+@dataclass
+class RestartConfig:
+    drain_seconds: float = 600.0  # how long a restart waits for the current wake to end
+
+
+@dataclass
 class Config:
     home: Path
     character_id: str
@@ -86,6 +105,8 @@ class Config:
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
+    exec: ExecConfig = field(default_factory=ExecConfig)
+    restart: RestartConfig = field(default_factory=RestartConfig)
 
     @property
     def db_path(self) -> Path:
@@ -127,6 +148,16 @@ class Config:
             raise ConfigError("heartbeat.interval_minutes must be positive")
         if self.provider.kind == "script" and not self.provider.script:
             raise ConfigError("provider.kind = 'script' requires provider.script")
+        e = self.exec
+        if not 0 < e.default_timeout_seconds <= e.max_timeout_seconds:
+            raise ConfigError("exec needs 0 < default_timeout_seconds <= max_timeout_seconds")
+        if e.max_sessions < 1 or e.output_buffer_bytes < 4096 or e.memory_mb < 64 or e.file_size_mb < 1:
+            raise ConfigError("exec limits are too small (max_sessions >= 1, output_buffer_bytes >= 4096, "
+                              "memory_mb >= 64, file_size_mb >= 1)")
+        if not e.shell.startswith(("/usr/", "/bin/")):
+            raise ConfigError("exec.shell must be under /usr or /bin")
+        if self.restart.drain_seconds < 0:
+            raise ConfigError("restart.drain_seconds must not be negative")
 
 
 def default_home() -> Path:
@@ -160,6 +191,8 @@ def load(home: Path) -> Config:
             heartbeat=HeartbeatConfig(**raw.get("heartbeat", {})),
             compaction=CompactionConfig(**raw.get("compaction", {})),
             plugins=PluginsConfig(**raw.get("plugins", {})),
+            exec=ExecConfig(**raw.get("exec", {})),
+            restart=RestartConfig(**raw.get("restart", {})),
         )
     except (KeyError, TypeError) as e:
         raise ConfigError(f"invalid config {path}: {e}") from e
@@ -168,7 +201,7 @@ def load(home: Path) -> Config:
 
 
 def render(cfg: Config) -> str:
-    p, lim, hb, c = cfg.provider, cfg.limits, cfg.heartbeat, cfg.compaction
+    p, lim, hb, c, e = cfg.provider, cfg.limits, cfg.heartbeat, cfg.compaction, cfg.exec
 
     def q(s: str) -> str:
         return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -242,4 +275,22 @@ max_maintenance_attempts = {c.max_maintenance_attempts}
 [plugins]
 # Plugins run sandboxed under bubblewrap with this interpreter (it must be under /usr).
 python = {q(cfg.plugins.python)}
+
+[exec]
+# Shell commands the character runs (shell_exec), sandboxed under bubblewrap: they see
+# the workspace, directories you granted (`whim access`), and the system's /usr and /etc,
+# with network only if granted. Running commands at all needs a grant too.
+enabled = {str(e.enabled).lower()}
+shell = {q(e.shell)}
+default_timeout_seconds = {e.default_timeout_seconds}
+max_timeout_seconds = {e.max_timeout_seconds}
+max_sessions = {e.max_sessions}
+output_buffer_bytes = {e.output_buffer_bytes}
+memory_mb = {e.memory_mb}
+file_size_mb = {e.file_size_mb}
+
+[restart]
+# A restart (`whim restart`, or the character's host_restart) waits this long for the
+# current wake to end before stopping anyway.
+drain_seconds = {cfg.restart.drain_seconds}
 """

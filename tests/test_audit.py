@@ -564,7 +564,10 @@ async def test_compactor_prompt_stays_within_its_window(rig):
     c = rig.cfg.compaction
     c.enabled = True
     est = compaction.estimate(h)
-    c.context_window_tokens = est + 2000  # the compactor's window is now tight
+    from whim import plugins
+    from whim.ledger import dumps
+    tools = int(len(dumps([t.schema() for t in plugins.snapshot(h)[1].values()])) / compaction.CHARS_PER_TOKEN)
+    c.context_window_tokens = est - tools + 2000  # the compactor's window (no tool schemas) is now tight
     c.summary_max_tokens = 1500
     c.reserve_tokens = 1000
     c.trigger_tokens = c.force_tokens = est - 1

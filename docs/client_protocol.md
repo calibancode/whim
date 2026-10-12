@@ -154,6 +154,31 @@ Both default to `after=0&follow=1`. A `Last-Event-ID` header, if present, overri
 Decisions are made only through these endpoints. Nothing said in a conversation, and
 no AG-UI event, grants anything.
 
+### 3.7 Access, settings and restarts (needs `operator`)
+
+- `GET /v1/access` returns `{"roots": [{"path", "access", "kind"}], "tools_on_path", "shell",
+  "shell_network", "grants", "sessions", "recent_sessions"}`. `kind` is `workspace`, `implementation` (whim's
+  own source, read-only unless granted) or `granted`.
+- `POST /v1/access` takes `{"action": "grant" | "revoke", "target", "write": false, "tool": false, "confirm": false}`. `target`
+  is an absolute folder path, `self` (the implementation), `shell` (running commands) or
+  `network` (network for commands). On `revoke`, `write: true` removes only write access.
+  `tool: true` also puts the folder on `PATH` for shell commands; a grant's reply lists
+  `unreachable_link_targets`, folders that symbolic links in it point to and that aren't
+  granted (so those programs won't run yet). A grant that comes with warnings (writable
+  places whose code runs outside the sandbox, credentials, `/run`, the whole home folder)
+  gets `409` with `{"error", "warnings": [...]}` unless `confirm: true`. `/`, `/proc`, `/sys`,
+  `/dev` and anything inside the whim home or credentials folder get `400`. Revoking kills
+  shell sessions that relied on it.
+- `GET /v1/config` returns `{"settings": {"section.key": value}, "waiting_for_restart": [...]}`.
+- `POST /v1/config` takes `{"changes": {"section.key": value}}`. Values may be strings, which
+  are parsed as TOML values of the key's type. The change is validated as a whole, saved
+  atomically and applied at once where possible; it returns `{"changed", "applied_now",
+  "saved_waiting_for_restart"}`. An invalid change gets `400` and nothing is saved.
+- `POST /v1/restart` takes `{"reason"?}` and returns `202` with the recorded intent. The
+  daemon stops starting new work (input is still accepted), waits for the current run,
+  checks that a new process would start, and exits for its systemd service to restart it.
+  Without that supervisor it gets `409`. `GET /v1/snapshot` shows `draining_for_restart`.
+
 ## 4. Native events
 
 ### 4.1 Envelope
@@ -208,7 +233,11 @@ Every SSE frame with data carries one JSON event:
 | `question.cancelled` / `question.expired` | h | yes / no | `question_id` |
 | `approval.requested` | h | yes or no | `approval_id, subject, scopes, summary` |
 | `approval.decided` | h | no | `approval_id, decision, subject, scopes, standing` |
-| `grant.revoked` | h | no | `grant_id, subject, scope` |
+| `grant.created` / `grant.revoked` | h | no | `grant_id, subject, scope` |
+| `config.changed` | o | either | `changes: {key: {old, new}}, by, live, needs_restart` |
+| `exec.started` | o | yes | `session_id, command, cwd, tty, network, timeout_seconds` |
+| `exec.exited` | o | no | `session_id, status: exited \| killed \| timed_out \| lost, exit_code, seconds?, reason?` |
+| `restart.requested` / `.cancelled` / `.completed` | o | either | `id, by?, reason?, version?` / `id, reason` / `id, by, version_before, version_after` |
 | `control.requested` | o | yes | `action, step?, input_id?, cancelled_model_request?` |
 | `schedule.armed` / `schedule.due` / `schedule.coalesced` | o | no | `schedule: heartbeat \| cron, wake_id, due_at, missed, job_id?, …` |
 | `schedule.fired` | o | yes | `schedule, wake_id, occurrence_id, due_at, missed, delay_seconds, …` |

@@ -49,7 +49,16 @@ DURABLE = frozenset(
         "plugin.deactivated",
         "approval.requested",  # a concrete permission request for the designated human
         "approval.decided",  # their decision, via the authenticated control path
+        "grant.created",  # the designated human granted access directly (whim access grant)
         "grant.revoked",
+        "config.changed",  # settings saved: {changes, by, live, needs_restart}
+        # shell sessions (whim.shell)
+        "exec.started",
+        "exec.exited",  # status: exited | killed | timed_out | lost (daemon stopped)
+        # restarts
+        "restart.requested",  # durable intent recorded; the daemon drains, checks, then exits
+        "restart.cancelled",  # the pre-restart check failed, or the drain was abandoned
+        "restart.completed",  # the next start found the intent and reported the outcome
         # host controls and questions
         "control.requested",  # the designated human stopped, interrupted or steered a run
         "question.created",

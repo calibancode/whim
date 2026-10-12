@@ -11,10 +11,13 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 from whim import (
+    access,
     authz,
     bootstrap,
     compaction,
@@ -24,8 +27,11 @@ from whim import (
     plugins,
     questions,
     recovery,
+    restart,
+    settings,
+    shell,
 )
-from whim.config import Config
+from whim.config import Config, ConfigError
 from whim.context import Context, block
 from whim.delivery import HUMAN, Deliveries
 from whim.ledger import Ledger, dumps, new_id
@@ -33,6 +39,7 @@ from whim.provider.base import Provider
 from whim.run import execute, start_run
 from whim.scheduler import Scheduler
 from whim.timebase import Timebase
+from whim.tools import host as host_tools
 from whim.tools.builtin import register_builtins
 from whim.tools.registry import Registry
 
@@ -75,12 +82,19 @@ class Harness:
         authz.ensure_schema(self.ledger)
         plugins.ensure_schema(self.ledger)
         questions.ensure_schema(self.ledger)
+        shell.ensure_schema(self.ledger)
         self.context = Context(self.ledger, cfg.workspace)
         self.deliveries = Deliveries(self.ledger)
         for d in destinations or []:
             self.deliveries.add_destination(d)
         self.registry = Registry()
         register_builtins(self.registry, self.deliveries, cfg.timezone)
+        shell.register(self.registry)
+        host_tools.register(self.registry)
+        self.shell = shell.Shell(self)
+        self.draining = False  # a restart is waiting for the current work to end
+        self.restart_requested = asyncio.Event()  # set when the daemon should exit to be restarted
+        self._restart_task: asyncio.Task | None = None
         self.fault_hook = fault_hook
         self.heartbeats_enabled = cfg.heartbeat.enabled
         self.scheduler = Scheduler(self)
@@ -110,12 +124,14 @@ class Harness:
         drive `scheduler.tick()` themselves with a controlled clock). It runs whether or
         not heartbeats are enabled: jobs and question expiry don't depend on them."""
         interrupted = recovery.reconcile(self)
+        self.shell.reconcile()
         questions.repair_links(self)
         bootstrap.retire_file(self)  # finish a retirement a crash interrupted
         self.context.ensure_epoch()
         with self.ledger.tx():
             plugins.commit_generation(self, "startup")
             self.ledger.append("host.started", {"interrupted_runs": interrupted})
+            restart.complete(self)
         self._worker = asyncio.create_task(self._work(), name="whim-worker")
         if run_scheduler:
             self._scheduler_task = asyncio.create_task(self._schedule(), name="whim-scheduler")
@@ -137,7 +153,10 @@ class Harness:
         self._kick.set()
         if self._scheduler_task is not None:
             self._scheduler_task.cancel()
+        if self._restart_task is not None and not self._restart_task.done():
+            self._restart_task.cancel()
         if self._worker is None:
+            await self.shell.close()
             return
         grace = self.cfg.limits.shutdown_grace_seconds if grace is None else grace
         try:
@@ -150,6 +169,7 @@ class Harness:
                 pass
         except BaseException:  # noqa: BLE001 - worker already died (e.g. simulated crash)
             pass
+        await self.shell.close()
 
     def close(self) -> None:
         self.ledger.close()
@@ -227,6 +247,118 @@ class Harness:
         self._nudge()
         return wake_id
 
+    # -- self-management (configuration, access, restart) ---------------------------------
+
+    def apply_config(self, changes: dict, *, actor: str, principal_id: str | None = None,
+                     run_id: str | None = None) -> dict:
+        """Validate and save a settings change; apply what can take effect at once to the
+        running daemon. Raises ConfigError (nothing saved) if the result isn't valid."""
+        _, after, diff = settings.update(self.cfg.home, changes)
+        live = [k for k in diff if settings.policy(k).apply == "live"]
+        for k in live:
+            obj, f = settings._fields(self.cfg)[k]
+            setattr(obj, f.name, settings.get(after, k))
+            if k == "heartbeat.enabled":
+                self.heartbeats_enabled = after.heartbeat.enabled
+        waiting = settings.pending_restart(self.cfg, after)
+        if diff:
+            with self.ledger.tx():
+                self.ledger.append("config.changed", {"changes": {k: v for k, v in diff.items()
+                                                                  if not settings.policy(k).hidden},
+                                                      "by": actor, "live": live, "needs_restart": waiting},
+                                   run_id=run_id, actor=actor,
+                                   origin={"kind": "control", "principal_id": principal_id} if principal_id else None)
+        self._nudge()
+        return {"changed": sorted(diff), "applied_now": live, "saved_waiting_for_restart": waiting}
+
+    def grant_access(self, target: str, *, write: bool, principal_id: str, tool: bool = False,
+                     confirm: bool = False) -> dict:
+        """The designated human grants a folder, `self` (the implementation), `shell` or `network`.
+        A grant with warnings raises access.ConfirmationNeeded unless `confirm`."""
+        subj, scopes, label = self._access_target(target, write, tool)
+        if subj.startswith("path:") and not confirm and authz.missing(self, subj, scopes):
+            warn = access.warnings(self, Path(subj[5:]), write=write) if target != "self" else []
+            if warn:
+                raise access.ConfirmationNeeded(warn)
+        with self.ledger.tx():
+            rows = access.grant(self, subj, scopes, principal_id)
+            if rows:
+                self.ledger.x("INSERT INTO notes(id, kind, text, status, created_at) VALUES(?, 'approval', ?, "
+                              "'pending', ?)", new_id("note"),
+                              block(f"host · access granted · {self.time.stamp()}",
+                                    f"Your human gave you {label}."), self.time.iso())
+        self._nudge()
+        out = {"granted": rows, **access.describe(self)}
+        if subj.startswith("path:"):
+            links = access.outside_links(Path(subj[5:]), [r.path for r in access.roots(self)])
+            if links:
+                out["unreachable_link_targets"] = links
+        return out
+
+    def revoke_access(self, target: str, *, write_only: bool, principal_id: str) -> dict:
+        subj, _, _ = self._access_target(target, write_only, revoking=True)
+        with self.ledger.tx():
+            rows = access.revoke_subject(self, subj, principal_id, [access.WRITE] if write_only else None)
+        killed = self.shell.enforce_access()
+        return {"revoked": rows, "killed_sessions": killed, **access.describe(self)}
+
+    def _access_target(self, target: str, write: bool, tool: bool = False,
+                       revoking: bool = False) -> tuple[str, list[str], str]:
+        if target == "shell":
+            return access.SHELL, [access.SHELL_RUN], "permission to run shell commands (sandboxed)"
+        if target == "network":
+            return access.SHELL, [access.SHELL_NET], "network access for your shell commands"
+        if target == "self":
+            path = access.implementation_root()
+            if not write:
+                raise authz.AuthzError("the implementation is always readable; grant self --write to allow edits")
+        else:
+            try:
+                path = access.check_grantable(self, target)
+            except access.AccessError as e:
+                if not revoking:
+                    raise authz.AuthzError(str(e)) from None
+                path = Path(os.path.realpath(os.path.expanduser(target)))  # revoke whatever was granted there
+        scopes = [access.READ, access.WRITE] if write else [access.READ]
+        label = f"{'read-write' if write else 'read-only'} access to {path}"
+        if tool:
+            scopes.append(access.TOOL)
+            label += ", with its programs on PATH for shell commands"
+        return access.subject(path), scopes, label
+
+    def request_restart(self, *, by: str, reason: str, note: str = "", run_id: str | None = None) -> dict:
+        """Record a restart intent and start draining. Raises RestartUnavailable when no
+        supervisor would start whim again. Joins an enclosing transaction if there is one."""
+        if not restart.supervised():
+            raise restart.RestartUnavailable(
+                "whim isn't running under its systemd user service, so nothing would start it again; "
+                "a foreground daemon has to be restarted by hand")
+        current = self.ledger.get_meta(restart.META_KEY)
+        if current and self.draining:
+            return current
+        with self.ledger.tx():
+            intent = restart.record(self, by=by, reason=reason, note=note, run_id=run_id)
+        self.draining = True
+        self._restart_task = asyncio.get_running_loop().create_task(self._drain_and_restart(intent))
+        return intent
+
+    async def _drain_and_restart(self, intent: dict) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.cfg.restart.drain_seconds
+        while loop.time() < deadline and not (self._idle.is_set() and self.active_run is None):
+            await asyncio.sleep(0.2)
+        ok, output = await restart.preflight(self.cfg.home)
+        if not ok:
+            self.log.warning("restart cancelled: startup check failed: %s", output)
+            restart.cancel(self, intent, "The startup check failed:\n" + output)
+            self.draining = False
+            if intent["by"] == "character":
+                self.request_wake(reason="restart_cancelled")
+            self._nudge()
+            return
+        self.log.info("restarting (%s)", intent["reason"])
+        self.restart_requested.set()
+
     def decide_approval(self, approval_id: str, approve: bool, principal_id: str, *, standing: bool = False) -> dict:
         """The designated human decides an approval request (authenticated control path only).
         Approving a plugin's request activates it; the character is told either way, at its
@@ -236,6 +368,17 @@ class Harness:
             row = authz.decide(self, approval_id, approve, principal_id, standing=standing)
             plugin = led.q1("SELECT * FROM plugins WHERE impl = ?", row["subject"])
             text = f"Your human {'approved' if approve else 'declined'} request {approval_id}."
+            if approve and row["subject"].startswith("config:"):
+                changes = json.loads(row["subject"][len("config:"):])
+                try:
+                    out = self.apply_config(changes, actor="character", principal_id=principal_id)
+                    text += (f" Settings changed: {', '.join(out['changed']) or 'none (already set)'}"
+                             + (f"; waiting for a restart: {', '.join(out['saved_waiting_for_restart'])}"
+                                if out["saved_waiting_for_restart"] else "") + ".")
+                except ConfigError as e:
+                    text += f" But the change could no longer be applied: {e}"
+            elif approve and (row["subject"].startswith("path:") or row["subject"] == access.SHELL):
+                text += " " + json.dumps(access.describe(self))
             if plugin is not None:
                 current = plugins.latest(self, plugin["name"])
                 if approve and current is not None and current["impl"] == plugin["impl"] \
@@ -335,6 +478,7 @@ class Harness:
         with self.ledger.tx():
             row = authz.revoke(self, grant_id, principal_id)
             plugins.commit_generation(self, f"revoked {grant_id}")
+        self.shell.enforce_access()
         return row
 
     def _nudge(self) -> None:
@@ -344,8 +488,8 @@ class Harness:
     # -- worker --------------------------------------------------------------
 
     def _next_job(self) -> dict | None:
-        if self._stopping:
-            return None
+        if self._stopping or self.draining:
+            return None  # draining for a restart: everything stays durably queued
         led = self.ledger
         pending = led.q1("SELECT 1 FROM inputs WHERE status = 'pending' LIMIT 1") is not None
         upkeep, urgent = compaction.next_job(self, pending)

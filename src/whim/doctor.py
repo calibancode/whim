@@ -323,9 +323,13 @@ class Doctor:
 
         path = service.unit_path()
         if path.exists():
-            self.add("ok" if str(self.home) in path.read_text() else "warn", "service",
-                     f"user service installed ({path.name})" + ("" if str(self.home) in path.read_text()
+            text = path.read_text()
+            self.add("ok" if str(self.home) in text else "warn", "service",
+                     f"user service installed ({path.name})" + ("" if str(self.home) in text
                                                                 else ", but for a different home"))
+            if "WHIM_SUPERVISOR" not in text:
+                self.add("info", "service", "the installed unit predates checked restarts; reinstall it to "
+                         "update (restarts still work under it)", "whim service install")
         else:
             self.add("info", "service", "no systemd user service installed", "whim service install")
 

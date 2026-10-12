@@ -1,4 +1,4 @@
-"""whim command line: init | run | chat | send | wake | events | status."""
+"""whim command line: init | run | chat | send | wake | events | status | config | access | restart | ..."""
 
 from __future__ import annotations
 
@@ -375,6 +375,120 @@ def cmd_auth(args: argparse.Namespace, home: Path) -> None:
         raise SystemExit(str(e)) from None
 
 
+def daemon_running(cfg: Config) -> bool:
+    import fcntl
+
+    lock = cfg.run_dir / "whim.lock"
+    if not lock.exists():
+        return False
+    with open(lock, "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+
+
+def _config_pairs(items: list[str]) -> dict[str, str]:
+    if len(items) == 2 and "=" not in items[0]:
+        return {items[0]: items[1]}
+    out = {}
+    for item in items:
+        key, eq, value = item.partition("=")
+        if not eq:
+            raise SystemExit(f"expected key=value, got {item!r}")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _show_value(v) -> str:
+    return json.dumps(v) if isinstance(v, str) else str(v).lower() if isinstance(v, bool) else str(v)
+
+
+def cmd_config(args: argparse.Namespace, home: Path) -> None:
+    """Inspect, change and validate settings. Works with or without a running daemon: a
+    running daemon applies changes itself (live where possible); otherwise the file is
+    updated directly, with the same validation."""
+    from whim import settings
+
+    if args.action == "validate":
+        import importlib
+        import pkgutil
+
+        import whim
+
+        try:
+            cfg = cfgmod.load(home)
+        except ConfigError as e:
+            raise SystemExit(f"invalid: {e}") from None
+        for mod in pkgutil.walk_packages(whim.__path__, "whim."):
+            if mod.name != "whim.__main__":
+                importlib.import_module(mod.name)
+        if args.startup:  # what `whim run` also needs; failing that exits 78, which isn't restarted
+            from whim.provider import ProviderError, from_config
+
+            try:
+                from_config(cfg.provider)
+            except ProviderError as e:
+                raise SystemExit(f"invalid: the provider can't be set up: {e}") from None
+        print(f"ok: {cfg.config_path} is valid and the whim package ({Path(whim.__file__).parent}) imports")
+        return
+    try:
+        cfg = cfgmod.load(home)
+    except ConfigError as e:
+        raise SystemExit(str(e)) from None
+    if args.action in ("show", "get"):
+        waiting: list[str] = []
+        if daemon_running(cfg) and cfg.socket_path.exists():
+            async def fetch():
+                async with Client(cfg) as c:
+                    return await c.get("/v1/config")
+            try:
+                waiting = asyncio.run(fetch()).get("waiting_for_restart", [])
+            except UNREACHABLE:
+                pass
+        if args.action == "get":
+            if not args.items:
+                raise SystemExit("usage: whim config get KEY")
+            try:
+                d = settings.describe(cfg, args.items[0])
+            except ConfigError as e:
+                raise SystemExit(str(e)) from None
+            print(f"{d['key']} = {_show_value(d['value'])}\n  type {d['type']}, default {_show_value(d['default'])}, "
+                  f"applies: {d['applies']}" + ("; character changes need approval" if d["needs_approval"] else "")
+                  + ("\n  saved, waiting for a restart" if d["key"] in waiting else ""))
+            return
+        values = settings.effective(cfg)
+        prefix = args.items[0] if args.items else ""
+        if args.json:
+            print(json.dumps({k: v for k, v in values.items() if k.startswith(prefix)}, indent=2))
+            return
+        for k, v in values.items():
+            if k.startswith(prefix):
+                marks = {"restart": " (restart)", "fixed": " (fixed)"}.get(settings.policy(k).apply, "")
+                print(f"{k} = {_show_value(v)}{marks}" + ("   ← saved, waiting for a restart" if k in waiting else ""))
+        return
+    # set
+    changes = _config_pairs(args.items)
+    if daemon_running(cfg):
+        async def post():
+            async with Client(cfg) as c:
+                return await c.post("/v1/config", {"changes": changes})
+        out = asyncio.run(post())
+    else:
+        try:
+            _, after, diff = settings.update(home, changes)
+        except ConfigError as e:
+            raise SystemExit(f"not saved: {e}") from None
+        out = {"changed": sorted(diff), "applied_now": [], "saved_waiting_for_restart": []}
+    print(f"changed: {', '.join(out['changed']) or 'nothing (already set)'}")
+    if out["applied_now"]:
+        print(f"in effect now: {', '.join(out['applied_now'])}")
+    if out["saved_waiting_for_restart"]:
+        print(f"saved, takes effect after a restart: {', '.join(out['saved_waiting_for_restart'])} (whim restart)")
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="whim")
     ap.add_argument("--home", type=Path, default=None, help="harness home (default $WHIM_HOME or ~/.local/share/whim)")
@@ -419,6 +533,21 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("id")
     p = sub.add_parser("revoke", help="revoke a grant")
     p.add_argument("id")
+    p = sub.add_parser("config", help="inspect, change and validate settings (secrets: see `whim auth`)")
+    p.add_argument("action", choices=["show", "get", "set", "validate"])
+    p.add_argument("items", nargs="*", help="show: [section]; get: KEY; set: KEY VALUE or KEY=VALUE ...")
+    p.add_argument("--json", action="store_true", help="show: as JSON")
+    p.add_argument("--startup", action="store_true", help=argparse.SUPPRESS)  # validate: also the provider
+    p = sub.add_parser("access", help="folders, shell commands and network the character may use")
+    p.add_argument("action", nargs="?", default="list", choices=["list", "grant", "revoke"])
+    p.add_argument("target", nargs="?", help="a folder path, `self` (whim's own source), `shell` or `network`")
+    p.add_argument("--write", action="store_true", help="grant: read-write (default read-only); "
+                                                         "revoke: only the write access")
+    p.add_argument("--tool", action="store_true", help="grant: also put the folder's programs on PATH for shell "
+                                                        "commands (e.g. ~/.cargo/bin)")
+    p.add_argument("--yes", action="store_true", help="grant: don't ask to confirm warnings")
+    p = sub.add_parser("restart", help="restart the service daemon after its current wake (checked first)")
+    p.add_argument("--reason", default="requested by the human")
     p = sub.add_parser("auth", help="manage provider API keys (stored owner-only, outside the repo)")
     p.add_argument("action", choices=["set", "status", "remove"])
     p.add_argument("provider", nargs="?", default="deepseek", choices=list(credentials.PROVIDERS))
@@ -434,6 +563,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.cmd == "auth":
         cmd_auth(args, home)
+        return
+
+    if args.cmd == "config":
+        cmd_config(args, home)
         return
 
     if args.cmd == "doctor":
@@ -458,7 +591,10 @@ def main(argv: list[str] | None = None) -> None:
         from whim import service
 
         try:
-            asyncio.run(serve(cfg))
+            if asyncio.run(serve(cfg)):
+                from whim import restart
+
+                sys.exit(restart.EXIT_RESTART)  # the systemd unit starts whim again
         except AlreadyRunning as e:  # distinct exit codes so a supervisor won't restart-loop
             print(e, file=sys.stderr)
             sys.exit(service.EXIT_ALREADY_RUNNING)
@@ -529,6 +665,40 @@ def main(argv: list[str] | None = None) -> None:
         for p in data["plugins"]:
             print(f"plugin {p['impl']}: {p['status']}")
 
+    async def show_access() -> None:
+        async with Client(cfg) as c:
+            data = await c.get("/v1/access")
+        for r in data["roots"]:
+            print(f"{r['access']:<10}  {r['path']}  ({r['kind']}{', on PATH' if r['path'] in data['tools_on_path'] else ''})")
+        print(f"shell commands: {'allowed' if data['shell'] else 'not allowed'}"
+              f"; network for them: {'allowed' if data['shell_network'] else 'not allowed'}")
+        for s in data["sessions"]:
+            print(f"session {s['session_id']} {s['status']}: {s['command'][:80]}")
+
+    def access_body() -> dict:
+        if not args.target:
+            raise SystemExit("give a folder path, `self`, `shell` or `network`")
+        target = args.target
+        if target not in ("self", "shell", "network"):
+            target = os.path.abspath(os.path.expanduser(target))
+        return {"action": args.action, "target": target, "write": args.write, "tool": args.tool}
+
+    async def grant_access() -> None:
+        body = {**access_body(), "confirm": args.yes}
+        async with Client(cfg) as c:
+            status, out = await c.try_post("/v1/access", body)
+            if status == 409 and out.get("warnings"):
+                for w in out["warnings"]:
+                    print(f"warning: {w}", file=sys.stderr)
+                if not sys.stdin.isatty():
+                    raise SystemExit("not granted: confirm with --yes")
+                if input("Grant anyway? [y/N] ").strip().lower() not in ("y", "yes"):
+                    raise SystemExit("not granted")
+                status, out = await c.try_post("/v1/access", {**body, "confirm": True})
+        if status >= 400:
+            raise SystemExit(out.get("error", f"failed ({status})"))
+        print(json.dumps(out))
+
     async def status() -> None:
         async with Client(cfg) as c:
             print(json.dumps(await c.get("/v1/snapshot"), indent=2, ensure_ascii=False))
@@ -565,6 +735,14 @@ def main(argv: list[str] | None = None) -> None:
                     "decision": args.cmd, "standing": bool(getattr(args, "always_sandboxed", False))}))
             case "revoke":
                 asyncio.run(oneshot(f"/v1/grants/{args.id}/revoke", {}))
+            case "access" if args.action == "list":
+                asyncio.run(show_access())
+            case "access" if args.action == "grant":
+                asyncio.run(grant_access())
+            case "access":
+                asyncio.run(oneshot("/v1/access", access_body()))
+            case "restart":
+                asyncio.run(oneshot("/v1/restart", {"reason": args.reason}))
     except (KeyboardInterrupt, BrokenPipeError):
         pass
     except aiohttp.ClientConnectionError as e:

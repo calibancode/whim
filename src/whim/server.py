@@ -17,6 +17,11 @@ principal, or authority.
   GET  /v1/approvals                 pending requests, grants, plugins      (designated human)
   POST /v1/approvals/{id}           {"decision": "approve"|"deny", "standing": bool}
   POST /v1/grants/{id}/revoke
+  GET  /v1/access                    folders, shell and network the character may use   (operator)
+  POST /v1/access                    {"action": "grant"|"revoke", "target": path|"self"|"shell"|"network", "write": bool, "tool": bool, "confirm": bool}
+  GET  /v1/config                    saved settings, and which wait for a restart        (operator)
+  POST /v1/config                    {"changes": {"section.key": value}}
+  POST /v1/restart                   {"reason": str}   drain, check, exit for the supervisor to restart
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ from typing import Annotated, Literal
 from aiohttp import web
 from pydantic import AfterValidator, BaseModel, ConfigDict, ValidationError
 
-from whim import agui, authz, compaction, cron, questions
+from whim import access, agui, authz, compaction, cron, questions, restart, settings, shell
 from whim import provider as providers
 from whim.config import Config, ConfigError
 from whim.harness import DIRECT, Harness
@@ -86,6 +91,25 @@ class DecisionBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: Literal["approve", "deny"]
     standing: bool = False  # also let any future validated plugin run without asking (no extra scopes)
+
+
+class AccessBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["grant", "revoke"]
+    target: str
+    write: bool = False
+    tool: bool = False
+    confirm: bool = False  # grant despite warnings (otherwise 409 with them)
+
+
+class ConfigBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    changes: dict[str, str | int | float | bool]
+
+
+class RestartBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = "requested by the human"
 
 
 class WakeBody(BaseModel):
@@ -294,6 +318,62 @@ def make_app(h: Harness, *, uid_of=peer_uid, entitlements: frozenset = PRINCIPAL
             return web.json_response({"error": str(e)}, status=e.status)
         return web.json_response(out)
 
+    async def get_access(request: web.Request) -> web.Response:
+        if (denied := operator_only(request)) is not None:
+            return denied
+        grants = [dict(r) for r in h.ledger.q("SELECT * FROM grants WHERE revoked_at IS NULL AND (subject LIKE "
+                                                 "'path:%' OR subject = 'shell') ORDER BY created_at")]
+        return web.json_response({**access.describe(h), "grants": grants,
+                                  "sessions": h.shell.listing(), "recent_sessions": shell.recorded(h, 10)})
+
+    async def post_access(request: web.Request) -> web.Response:
+        if (denied := operator_only(request)) is not None:
+            return denied
+        try:
+            body = AccessBody.model_validate(await request.json())
+            if body.action == "grant":
+                out = h.grant_access(body.target, write=body.write, tool=body.tool, confirm=body.confirm,
+                                     principal_id=request[PRINCIPAL])
+            else:
+                out = h.revoke_access(body.target, write_only=body.write, principal_id=request[PRINCIPAL])
+        except access.ConfirmationNeeded as e:
+            return web.json_response({"error": str(e), "warnings": e.warnings}, status=409)
+        except (ValidationError, json.JSONDecodeError, authz.AuthzError) as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response(out)
+
+    async def get_config(request: web.Request) -> web.Response:
+        if (denied := operator_only(request)) is not None:
+            return denied
+        try:
+            saved = settings.load_saved(h)
+        except ConfigError as e:
+            return web.json_response({"error": str(e)}, status=409)
+        return web.json_response({"settings": settings.effective(saved),
+                                  "waiting_for_restart": settings.pending_restart(h.cfg, saved)})
+
+    async def post_config(request: web.Request) -> web.Response:
+        if (denied := operator_only(request)) is not None:
+            return denied
+        try:
+            body = ConfigBody.model_validate(await request.json())
+            out = h.apply_config(body.changes, actor="human", principal_id=request[PRINCIPAL])
+        except (ValidationError, json.JSONDecodeError, ConfigError) as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response(out)
+
+    async def post_restart(request: web.Request) -> web.Response:
+        if (denied := operator_only(request)) is not None:
+            return denied
+        try:
+            body = RestartBody.model_validate(await request.json() if request.can_read_body else {})
+            intent = h.request_restart(by="human", reason=body.reason)
+        except (ValidationError, json.JSONDecodeError) as e:
+            return web.json_response({"error": str(e)}, status=400)
+        except restart.RestartUnavailable as e:
+            return web.json_response({"error": str(e)}, status=409)
+        return web.json_response({"restart": intent, "active_run": h.active_run}, status=202)
+
     async def get_snapshot(request: web.Request) -> web.Response:
         led = h.ledger
         runs = led.q("SELECT id, status, reason, started_at, ended_at, requests, tool_calls FROM runs "
@@ -314,6 +394,7 @@ def make_app(h: Harness, *, uid_of=peer_uid, entitlements: frozenset = PRINCIPAL
                           "active_cues": led.q1("SELECT COUNT(*) c FROM cues WHERE status = 'active'")["c"]},
             "jobs": cron.listing(h),
             "context": compaction.status(h),
+            "draining_for_restart": h.draining,
             "messages_to_human": [dict(m) for m in reversed(msgs)],
         })
 
@@ -330,6 +411,11 @@ def make_app(h: Harness, *, uid_of=peer_uid, entitlements: frozenset = PRINCIPAL
     app.router.add_post("/v1/approvals/{id}", post_approval)
     app.router.add_post("/v1/grants/{id}/revoke", post_revoke)
     app.router.add_get("/v1/snapshot", get_snapshot)
+    app.router.add_get("/v1/access", get_access)
+    app.router.add_post("/v1/access", post_access)
+    app.router.add_get("/v1/config", get_config)
+    app.router.add_post("/v1/config", post_config)
+    app.router.add_post("/v1/restart", post_restart)
     return app
 
 
@@ -349,7 +435,8 @@ def acquire_lock(cfg: Config):
     return f
 
 
-async def serve(cfg: Config) -> None:
+async def serve(cfg: Config) -> bool:
+    """Run until SIGTERM/SIGINT (returns False) or a checked restart request (True)."""
     lock = acquire_lock(cfg)
     provider = providers.from_config(cfg.provider)
     h = Harness(cfg, provider)
@@ -376,8 +463,12 @@ async def serve(cfg: Config) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
-    await stop.wait()
-    h.log.info("shutting down")
+    waiters = [asyncio.ensure_future(stop.wait()), asyncio.ensure_future(h.restart_requested.wait())]
+    await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+    for w in waiters:
+        w.cancel()
+    restarting = h.restart_requested.is_set()
+    h.log.info("shutting down" + (" to restart" if restarting else ""))
     await h.stop()
     await runner.cleanup()
     sock.unlink(missing_ok=True)
@@ -386,3 +477,4 @@ async def serve(cfg: Config) -> None:
         await h._compactor.close()
     h.close()
     lock.close()
+    return restarting
