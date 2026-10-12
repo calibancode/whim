@@ -36,7 +36,10 @@ class Plugin:
 
     def tool(self, fn=None, *, description=None):
         def register(f):
-            sig = inspect.signature(f)
+            try:  # resolves string annotations (`from __future__ import annotations`)
+                sig = inspect.signature(f, eval_str=True)
+            except Exception:  # a name that only exists for type checkers
+                sig = inspect.signature(f)
             props, required = {}, []
             for pname, param in sig.parameters.items():
                 schema = {"type": TYPES.get(param.annotation, "string")}

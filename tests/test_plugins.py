@@ -82,6 +82,27 @@ async def test_install_validates_into_a_frozen_content_addressed_copy(rig):
     assert ["plugin.installed", "plugin.validated"] == [t for t in types(h) if t.startswith("plugin.")]
 
 
+async def test_parameter_types_survive_postponed_annotations(rig):
+    """`from __future__ import annotations` turns type hints into strings; the schema the
+    host records must still say integer, not string."""
+    h = await rig.start()
+    write_plugin(rig, "plugins/rep", "repeat", '''from __future__ import annotations
+from whim_plugin import Plugin
+plugin = Plugin("repeat")
+
+@plugin.tool
+def say(text: str, times: int = 2, loud: bool = False) -> dict:
+    "Repeat a text."
+    return {"text": " ".join([text.upper() if loud else text] * times)}
+
+plugin.run()
+''')
+    row = await install(h, "plugins/rep")
+    [tool] = json.loads(row["tools"])
+    props = tool["inputSchema"]["properties"]
+    assert (props["text"]["type"], props["times"]["type"], props["loud"]["type"]) == ("string", "integer", "boolean")
+
+
 @pytest.mark.parametrize("name,code,kw,error", [
     ("file", WORDCOUNT, {}, "reserved"),  # can't shadow a built-in namespace
     ("ok", WORDCOUNT, {"permissions": ["root"]}, "permissions may only"),

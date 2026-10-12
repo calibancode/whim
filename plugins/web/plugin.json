@@ -1,0 +1,8 @@
+{
+  "name": "web",
+  "description": "Read-only web research: search the web and read pages, documentation, source files, PDFs and public APIs.",
+  "entry": "server.py",
+  "permissions": ["net"],
+  "timeout_seconds": 120,
+  "version": "0.2.0"
+}
