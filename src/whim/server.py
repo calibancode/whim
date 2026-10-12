@@ -6,6 +6,11 @@ kernel (SO_PEERCRED) and must equal the configured designated-human uid. The hos
 then attaches the opaque principal id itself; request bodies cannot set origin,
 principal, or authority.
 
+A client may name itself in a `Whim-Interface` header (a short lowercase slug such as
+`tui` or `android`). It is recorded with direct input so the character can tell which
+interface a message came through, and grants nothing: authority is still the peer uid's.
+The remote gateway re-validates its remote clients' header and always sets one.
+
   POST /v1/input      {"text": str, "client_message_id": str?}
   POST /v1/wake       {"reason": str?, "text": str?}       host control
   GET  /v1/events     ?after=<seq>&follow=0|1  (SSE; id = durable seq; Last-Event-ID honoured)
@@ -40,7 +45,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, ValidationError
 
 from whim import access, agui, authz, compaction, cron, questions, restart, settings, shell
 from whim import provider as providers
-from whim.config import Config, ConfigError
+from whim.config import INTERFACE_HEADER, INTERFACE_RE, Config, ConfigError
 from whim.harness import DIRECT, Harness
 
 KEEPALIVE_SECONDS = 15.0
@@ -62,6 +67,7 @@ Text = Annotated[str, AfterValidator(_bounded)]
 PRINCIPAL = web.RequestKey("principal_id", str)
 ENTITLEMENTS = web.RequestKey("entitlements", frozenset)
 PREFIX = web.RequestKey("sse_prefix", list)
+INTERFACE = web.RequestKey("interface", object)
 # v1 has one authenticated principal, the designated human, entitled to everything.
 PRINCIPAL_ENTITLEMENTS = frozenset({"operator", "human"})
 
@@ -138,6 +144,8 @@ def make_app(h: Harness, *, uid_of=peer_uid, entitlements: frozenset = PRINCIPAL
             return web.json_response({"error": "forbidden"}, status=403)
         request[PRINCIPAL] = cfg.principal_id
         request[ENTITLEMENTS] = entitlements
+        named = request.headers.get(INTERFACE_HEADER, "").strip()
+        request[INTERFACE] = named if INTERFACE_RE.fullmatch(named) else None
         return await handler(request)
 
     async def post_input(request: web.Request) -> web.Response:
@@ -151,6 +159,7 @@ def make_app(h: Harness, *, uid_of=peer_uid, entitlements: frozenset = PRINCIPAL
             principal_id=request[PRINCIPAL],
             source_message_id=body.client_message_id,
             mode="next_run" if body.when == "next_run" else "normal",
+            interface=request[INTERFACE],
         )
         return web.json_response({**rec, "duplicate": dup}, status=200 if dup else 202)
 
@@ -293,7 +302,8 @@ def make_app(h: Harness, *, uid_of=peer_uid, entitlements: frozenset = PRINCIPAL
             else:
                 if not (body.text or "").strip():
                     return web.json_response({"error": "steer needs text"}, status=400)
-                out = h.control_steer(body.text, request[PRINCIPAL], body.client_message_id)
+                out = h.control_steer(body.text, request[PRINCIPAL], body.client_message_id,
+                                      interface=request[INTERFACE])
         except (ValidationError, json.JSONDecodeError) as e:
             return web.json_response({"error": str(e)}, status=400)
         except authz.AuthzError as e:
@@ -311,7 +321,8 @@ def make_app(h: Harness, *, uid_of=peer_uid, entitlements: frozenset = PRINCIPAL
         try:
             body = AnswerBody.model_validate(await request.json())
             out = h.answer_question(request.match_info["id"], request[PRINCIPAL], choice=body.choice,
-                                    text=body.text, client_message_id=body.client_message_id)
+                                    text=body.text, client_message_id=body.client_message_id,
+                                    interface=request[INTERFACE])
         except (ValidationError, json.JSONDecodeError) as e:
             return web.json_response({"error": str(e)}, status=400)
         except questions.QuestionError as e:

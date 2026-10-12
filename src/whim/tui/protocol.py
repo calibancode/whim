@@ -138,7 +138,7 @@ class Link:
         self.problem = ""  # the last stream problem worth showing
 
     async def start(self) -> None:
-        self.client = Client(self.cfg, read_timeout=REQUEST_TIMEOUT)
+        self.client = Client(self.cfg, read_timeout=REQUEST_TIMEOUT, interface="tui")
 
     async def close(self) -> None:
         if self.client is not None:

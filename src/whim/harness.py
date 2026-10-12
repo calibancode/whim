@@ -193,9 +193,12 @@ class Harness:
         route: dict | None = None,
         mode: str = "normal",
         question_id: str | None = None,
+        interface: str | None = None,
     ) -> tuple[dict, bool]:
         """Persist attributed input. Attribution comes from the caller's verified
-        transport, never from the payload. Returns (record, duplicate)."""
+        transport, never from the payload. `interface` (direct input only) names the client
+        it came through, e.g. tui or android: a label for the character, never authority.
+        Returns (record, duplicate)."""
         led = self.ledger
         if source_message_id is not None:
             dup = led.q1(
@@ -206,6 +209,8 @@ class Harness:
                 return dict(dup), True
         if route is None:
             route = {"via": source_kind, "label": "human", "destination": HUMAN}
+            if interface and source_kind == DIRECT:
+                route["interface"] = interface
         input_id = new_id("in")
         with led.tx():
             led.x(
@@ -220,6 +225,7 @@ class Harness:
             ev = led.append(
                 "input.received",
                 {"input_id": input_id, "text": text, "source_message_id": source_message_id, "via": route.get("via"),
+                 **({"interface": route["interface"]} if route.get("interface") else {}),
                  "sender": attribution(source_kind, route), "reply_destination": route.get("destination"),
                  **({"mode": mode} if mode != "normal" else {}), **({"question_id": question_id} if question_id else {})},
                 actor="human" if source_kind == DIRECT else "external",
@@ -437,13 +443,14 @@ class Harness:
         self._run_task.cancel()
         return {"interrupting": self._interrupting}
 
-    def control_steer(self, text: str, principal_id: str, client_message_id: str | None = None) -> dict:
+    def control_steer(self, text: str, principal_id: str, client_message_id: str | None = None,
+                      interface: str | None = None) -> dict:
         """Admit a message to the active run right away: a model response still being
         written is discarded and requested again with the message; a running tool is not
         cut off (the message enters as soon as it finishes)."""
         self._require_human(principal_id)
         rec, _ = self.submit_input(text, principal_id=principal_id, source_message_id=client_message_id,
-                                   mode="steer")
+                                   mode="steer", interface=interface)
         state = self.active_state
         self._control_event("steer", principal_id, input_id=rec["id"],
                             cancelled_model_request=bool(state and self.provider_call))

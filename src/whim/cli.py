@@ -17,7 +17,7 @@ import aiohttp
 
 from whim import config as cfgmod
 from whim import credentials, onboard
-from whim.config import Config, ConfigError
+from whim.config import INTERFACE_HEADER, Config, ConfigError
 from whim.provider.base import ProviderError
 
 KEEPALIVE_GRACE = 45.0  # the daemon sends a keepalive every 15 s on a quiet stream
@@ -32,12 +32,15 @@ OVERSIZED = {"type": "whim.client.oversized"}  # stands in for a frame larger th
 
 
 class Client:
-    def __init__(self, cfg: Config, read_timeout: float | None = None):
+    def __init__(self, cfg: Config, read_timeout: float | None = None, interface: str = "cli"):
         """`read_timeout` bounds the wait for each response (not event streams); past it
-        the outcome is unknown, like any failure after connecting."""
+        the outcome is unknown, like any failure after connecting. `interface` names this
+        client to the daemon, so the character sees where a
+        message came from."""
         self.cfg = cfg
         self.session = aiohttp.ClientSession(
             connector=aiohttp.UnixConnector(path=str(cfg.socket_path)),
+            headers={INTERFACE_HEADER: interface},
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=read_timeout),
         )
 

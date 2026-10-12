@@ -13,6 +13,9 @@ from whim.timebase import detect_timezone, zone
 
 CACHE_USER_ID_RE = re.compile(r"^[a-zA-Z0-9\-_]{1,512}$")
 CHARACTER_FILES = ("IDENTITY.md", "SOUL.md", "USER.md", "MEMORY.md")
+# A direct client names itself in this header (see whim.server); a label, never authority.
+INTERFACE_HEADER = "Whim-Interface"
+INTERFACE_RE = re.compile(r"[a-z][a-z0-9-]{0,23}")
 
 
 class ConfigError(Exception):

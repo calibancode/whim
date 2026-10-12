@@ -21,7 +21,7 @@ whim auth set
 
 Start the daemon with `whim run`, then open another terminal and run `whim tui` ([the terminal interface](docs/tui.md)), or `whim chat` for a plain line-based chat.
 
-See `whim --help` for available commands, [administration](docs/administration.md) for access, settings and restarts, and [the client protocol](docs/client_protocol.md) for writing your own interface.
+See `whim --help` for available commands, [administration](docs/administration.md) for access, settings and restarts, and [the client protocol](docs/client_protocol.md) for writing your own interface. [Remote access](docs/gateway.md) covers `whim-gateway`, which lets the Android app reach the daemon over Tailscale.
 
 ## License
 

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from whim import journal, safefs
+from whim import context, journal, safefs
 from whim.tools.registry import ToolResult
 
 if TYPE_CHECKING:
@@ -55,6 +55,8 @@ def _event_item(h, ev: dict, terms: list[str]) -> dict | None:
         kind = f"I sent to {d.get('destination')}"
     elif ev["type"] == "input.received":
         kind = f"message to me via {d.get('via') or 'direct'}"
+        if d.get("interface"):
+            kind += f" · {context.interface_name(d['interface'])}"
     return {"ref": ev["seq"], "when": h.time.stamp(ev["at"]), "kind": kind, "text": _snippet(text, terms)}
 
 

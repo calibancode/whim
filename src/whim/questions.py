@@ -156,7 +156,7 @@ def expire_due(h: "Harness") -> int:
 
 
 def answer(h: "Harness", question_id: str, principal_id: str, *, choice: str | int | None = None,
-           text: str | None = None, client_message_id: str | None = None) -> dict:
+           text: str | None = None, client_message_id: str | None = None, interface: str | None = None) -> dict:
     """The designated human answers (authenticated control path only)."""
     led = h.ledger
     if principal_id != h.cfg.principal_id:
@@ -191,7 +191,7 @@ def answer(h: "Harness", question_id: str, principal_id: str, *, choice: str | i
         quoted = row["text"] if len(row["text"]) <= 200 else row["text"][:200] + "…"
         body = f"(answering your question: \"{quoted}\")\n"
         body += (f"{picked}" + (f" — {words}" if words else "")) if picked else words
-        rec, dup = h.submit_input(body, principal_id=principal_id, question_id=question_id,
+        rec, dup = h.submit_input(body, principal_id=principal_id, question_id=question_id, interface=interface,
                                   source_message_id=client_message_id or f"answer:{question_id}")
         led.x("UPDATE questions SET status = 'answered', closed_at = ?, answer_input_id = ?, answer_choice = ?, "
               "answer_text = ? WHERE id = ?", h.time.iso(), rec["id"], picked, words or None, question_id)
