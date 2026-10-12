@@ -25,4 +25,4 @@ See `whim --help` for available commands, [administration](docs/administration.m
 
 ## License
 
-AGPL-3.0-only. See [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md).
+AGPL-3.0-only ([LICENSE](LICENSE)); [whim_plugin.py](src/whim/plugin_sdk/whim_plugin.py) is MIT. See [third-party notices](THIRD_PARTY_NOTICES.md).
