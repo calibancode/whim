@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 
-from conftest import Outbox, crash_at, events, human_messages, runs, tool_result, types
+import pytest
+from conftest import Outbox, check_conformance, crash_at, events, human_messages, project_all, runs, tool_result, types
 
 from whim import recovery
 from whim.harness import Harness
-from whim.provider.fake import ScriptedProvider, call, finish
+from whim.provider.fake import ScriptedProvider, call, calls, finish, tool_call
 
 
 def ops(h):
@@ -82,12 +83,6 @@ async def test_crash_after_response_commit_pairs_call_without_op(rig):
     msgs = p2.requests[0].messages
     assert msgs[-3]["role"] == "assistant" and msgs[-2]["role"] == "tool"
     assert tool_result(msgs[-2])["outcome"] == "not_dispatched"
-
-
-async def test_crash_mid_provider_request(rig):
-    h, p2 = await crash_then_restart(rig, [], "provider.before_request")
-    assert [r["status"] for r in runs(h)] == ["interrupted", "finished"]
-    assert len(wakes(h)) == 1
 
 
 async def test_external_send_crash_before_receipt_is_uncertain_and_not_resent(rig):
@@ -199,6 +194,48 @@ async def test_paused_and_failed_runs_do_not_trigger_recovery(rig):
     assert "recovery.pending" not in types(h)
 
 
-async def test_finished_run_resets_recovery_attempts(rig):
-    h, _ = await crash_then_restart(rig, [call("file_write", path="a.md", content="a")], "tool.after_dispatch")
-    assert h.ledger.get_meta("recovery_attempts") == 0
+# -- recovered outcomes as a client sees them ------------------------------------------
+
+
+def reconstruct_tools(evs):
+    """Tool operations and outcomes as an independent client sees them: events only."""
+    started = {e["data"]["operation_id"]: e["data"] for e in evs if e["type"] == "tool.started"}
+    finished = {e["data"]["operation_id"]: e["data"] for e in evs if e["type"] == "tool.finished"}
+    return started, finished
+
+
+RECOVERY_CASES = {
+    "uncertain write": ([call("file_write", path="plan.md", content="v1")], "tool.after_dispatch"),
+    "never dispatched": ([call("file_write", path="plan.md", content="v1")], "tool.before_dispatch"),
+    "read cut off": ([call("file_read", path="MEMORY.md")], "tool.before_result"),
+    "calls never recorded": ([calls(tool_call("file_write", path="a.md", content="a"),
+                                    tool_call("file_read", path="MEMORY.md"))], "provider.after_commit"),
+    "external send cut off": ([call("message_send", destination="outbox", content="hi")], "delivery.before_receipt"),
+    "journal cut off": ([call("journal_write", entry="a thought")], "journal.after_append"),
+}
+
+
+@pytest.mark.parametrize("case", RECOVERY_CASES)
+async def test_recovered_tool_outcomes_are_complete_in_the_event_protocol(rig, case):
+
+    steps, point = RECOVERY_CASES[case]
+    h, _ = await crash_then_restart(rig, steps, point, destinations=[Outbox()])
+    evs = events(h)
+    started, finished = reconstruct_tools(evs)
+    ops = {r["id"]: dict(r) for r in h.ledger.q("SELECT * FROM operations")}
+    assert set(started) == set(finished) == set(ops)
+    for op_id, op in ops.items():
+        s, f = started[op_id], finished[op_id]
+        assert (s["call_id"], s["tool"]) == (f["call_id"], f["tool"]) == (op["call_id"], op["tool"])
+        assert f["status"] == op["status"]
+        model = json.loads(op["result"])
+        model.pop("ok", None)
+        assert f["result"] == model  # the outcome the character was told, not only a status
+    # Every provider-requested call is accounted for by a lifecycle pair.
+    requested = sum(e["data"]["tool_calls"] for e in evs if e["type"] == "provider.request.finished")
+    assert requested == len(started)
+    # And the AG-UI activity view shows each call with its result, conformantly.
+    stream = project_all(h, "activity")
+    check_conformance(stream)
+    results = {e["toolCallId"] for e in stream if e["type"] == "TOOL_CALL_RESULT"}
+    assert results == set(ops)

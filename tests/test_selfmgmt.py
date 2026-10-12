@@ -5,18 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 
 import pytest
-from conftest import events, types
+from conftest import approve_pending, events, needs_bwrap, types
 
 from whim import access, authz, restart, settings
 from whim import config as cfgmod
 from whim.cli import main as cli_main
 from whim.config import ConfigError
 from whim.provider.fake import call, finish
-
-needs_bwrap = pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap not installed")
 
 
 async def use_tools(h, rig, *steps, text="go"):
@@ -36,20 +33,12 @@ def latest_opening(rig) -> str:
     return next(m["content"] for m in reversed(msgs) if m["role"] == "user")
 
 
-def approve_pending(h):
-    for a in h.ledger.q("SELECT id FROM approvals WHERE status = 'pending'"):
-        h.decide_approval(a["id"], True, h.cfg.principal_id)
-
-
 @pytest.fixture
 def project(tmp_path):
     d = tmp_path / "project"
     d.mkdir()
     (d / "main.py").write_text("print('hello from project')\n")
     return d
-
-
-# -- settings ------------------------------------------------------------------------------
 
 
 def test_settings_validate_cross_field_and_save_atomically(cfg):
@@ -117,9 +106,6 @@ async def test_host_config_live_change_and_approval_for_sensitive(rig):
     r = await use_tools(h, rig, call("host_config", op="get"))
     assert r[0]["saved_but_waiting_for_restart"] == ["provider.model"]
     assert h.cfg.provider.model == "deepseek-v4-pro"
-
-
-# -- file access ---------------------------------------------------------------------------
 
 
 async def test_implementation_is_readable_not_writable(rig):
@@ -266,9 +252,6 @@ async def test_broad_grants_mask_whim_state_secrets_sockets_and_self(rig, projec
     agent.close()
 
 
-# -- shell ---------------------------------------------------------------------------------
-
-
 @needs_bwrap
 async def test_shell_needs_permission_then_runs_sandboxed(rig, project, tmp_path):
     h = await rig.start()
@@ -405,9 +388,6 @@ async def test_revoking_access_kills_sessions_that_use_it(rig, project):
     assert out["killed_sessions"] == [r[0]["session_id"]]
 
 
-# -- restart -------------------------------------------------------------------------------
-
-
 async def test_restart_refused_without_a_supervisor(rig, monkeypatch):
     monkeypatch.delenv("WHIM_SUPERVISOR", raising=False)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
@@ -454,11 +434,3 @@ async def test_failed_preflight_cancels_the_restart(rig, monkeypatch):
     assert not h.draining and not h.restart_requested.is_set()
     opening = latest_opening(rig)
     assert "restart cancelled" in opening and "SyntaxError" in opening
-
-
-def test_service_unit_restarts_on_the_restart_exit_code(cfg):
-    from whim import service
-
-    text = service.unit_text(cfg)
-    assert f"RestartForceExitStatus={restart.EXIT_RESTART}" in text and "WHIM_SUPERVISOR=systemd" in text
-    assert str(restart.EXIT_RESTART) not in text.split("RestartPreventExitStatus=")[1].split("\n")[0]

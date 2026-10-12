@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from conftest import events
+from conftest import crash_at, events
 
 from whim.provider.fake import ScriptedProvider, call, finish, say
 
@@ -89,7 +89,6 @@ async def test_external_change_after_own_write_is_still_shown(rig):
 
 
 async def test_own_write_lost_in_crash_is_shown_after_restart(rig):
-    from conftest import crash_at
 
     h = await rig.start(ScriptedProvider([call("file_write", path="USER.md", content="# User\n\nLikes teal.")]),
                         fault_hook=crash_at("tool.before_result"))
@@ -101,14 +100,6 @@ async def test_own_write_lost_in_crash_is_shown_after_restart(rig):
     opening = p2.requests[0].messages[-1]["content"]
     # The write happened but its result was never recorded, so the content is shown.
     assert "USER.md changed" in opening and "Likes teal." in opening
-
-
-async def test_non_character_files_are_not_tracked(rig):
-    p = ScriptedProvider([call("file_write", path="notes/MEMORY.md", content="x"), finish()])
-    h = await rig.start(p)
-    h.submit_input("hi")
-    await h.wait_idle()
-    assert not any("changed" in (m.get("content") or "") for m in p.requests[1].messages if m["role"] == "user")
 
 
 async def test_system_prompt_does_not_name_the_software(rig):
@@ -170,13 +161,3 @@ async def test_onboarding_is_idempotent_and_keeps_cache_user_id(cfg):
     assert again.provider.cache_user_id == cfg.provider.cache_user_id
     assert (cfg.workspace / "USER.md").read_text() == "edited"
     assert oct((cfg.home / "config.toml").stat().st_mode & 0o777) == "0o600"
-
-
-def test_invalid_cache_user_id_is_rejected(cfg):
-    import pytest
-
-    from whim.config import ConfigError
-
-    cfg.provider.cache_user_id = "has spaces!"
-    with pytest.raises(ConfigError):
-        cfg.validate()

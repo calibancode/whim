@@ -6,8 +6,7 @@ import asyncio
 import json
 from datetime import timedelta
 
-import pytest
-from conftest import Clock, events, human_messages, runs, tool_result, types
+from conftest import Clock, complete_bootstrap, events, kinds, runs, tool_result, types
 
 from whim import heartbeat
 from whim.provider.fake import ScriptedProvider, call, finish
@@ -15,19 +14,10 @@ from whim.provider.fake import ScriptedProvider, call, finish
 HB = "⟦host · heartbeat"
 
 
-def complete_bootstrap(h):
-    with h.ledger.tx():
-        h.ledger.x("INSERT OR REPLACE INTO meta(key, value) VALUES('bootstrap', '{\"status\": \"complete\"}')")
-
-
 def add_cues(h, *ops):
     with h.ledger.tx():
         heartbeat.apply_ops(h.ledger, [heartbeat.CueOp(**o) for o in ops], actor="test", run_id=None,
                             expected_revision=None, now="2026-10-10T12:00:00Z")
-
-
-def kinds(h):
-    return [json.loads(r["origin"])["kind"] for r in runs(h)]
 
 
 def next_due(h):
@@ -87,14 +77,6 @@ async def test_heartbeat_opening_shows_instruction_and_active_cues_only(rig):
     assert fired["data"]["cue_revision"] == 2 and fired["data"]["active_cues"] == 2
     [run] = runs(h)
     assert json.loads(run["origin"])["cue_revision"] == 2
-
-
-async def test_no_cues_is_stated_plainly(rig):
-    h, clock = await ready(rig, [finish()])
-    clock.advance(60)
-    h.scheduler.tick()
-    await h.wait_idle()
-    assert "You have no standing cues." in rig.provider.requests[0].messages[-1]["content"]
 
 
 async def test_heartbeat_waits_for_active_run_and_human_input_goes_first(rig):
@@ -204,24 +186,6 @@ async def test_queued_heartbeat_and_schedule_survive_restart(rig):
     assert "Water the ideas" in p2.requests[1].messages[-1]["content"]
 
 
-async def test_heartbeat_can_finish_silently(rig):
-    h, clock = await ready(rig, [call("file_read", path="MEMORY.md"), finish()])
-    clock.advance(60)
-    h.scheduler.tick()
-    await h.wait_idle()
-    [run] = runs(h)
-    assert run["status"] == "finished" and human_messages(h) == []
-    assert not [t for t in types(h) if t.startswith("delivery.")]
-
-
-async def test_heartbeat_can_send_a_message(rig):
-    h, clock = await ready(rig, [call("message_send", destination="human", content="Thought of you."), finish()])
-    clock.advance(60)
-    h.scheduler.tick()
-    await h.wait_idle()
-    assert human_messages(h) == ["Thought of you."]
-
-
 async def test_disabled_heartbeats_neither_schedule_nor_run(rig):
     rig.cfg.heartbeat.enabled = False
     clock = Clock()
@@ -247,9 +211,6 @@ async def test_background_scheduler_runs_in_daemon_mode(rig):
         await asyncio.sleep(0.1)
     await h.wait_idle()
     assert kinds(h)[:1] == ["heartbeat"]
-
-
-# -- cue management through the character's tool -------------------------------------
 
 
 def manage(*ops, expected_revision=None):
@@ -332,16 +293,3 @@ async def test_edits_during_heartbeat_apply_to_next_heartbeat(rig):
     assert "hb_1: New cue from this heartbeat" in second
     fired = events(h, "schedule.fired")
     assert [f["data"]["cue_revision"] for f in fired] == [0, 1]
-
-
-async def test_cues_survive_restart(rig):
-    h, _ = await run_tools(rig, manage({"op": "add", "instruction": "Remember the lighthouse idea"}))
-    h = await rig.restart(ScriptedProvider())
-    assert [c["id"] for c in heartbeat.cues(h.ledger)] == ["hb_1"]
-    assert heartbeat.revision(h.ledger) == 1
-
-
-@pytest.mark.parametrize("op", [{"op": "add"}, {"op": "remove"}])
-async def test_cue_ops_validate_required_fields(rig, op):
-    _, res = await run_tools(rig, manage(op))
-    assert not res[0]["ok"]

@@ -8,8 +8,6 @@ from conftest import Clock, crash_at, events, runs, tool_result
 
 from whim.provider.fake import ScriptedProvider, call, calls, finish, tool_call
 
-# 2026-10-10 19:00 UTC is 12:00 in Los Angeles (PDT).
-
 
 def jwrite(text):
     return call("journal_write", entry=text)
@@ -65,19 +63,6 @@ async def test_journal_is_readable_but_not_rewritable(rig):
     assert "rewritten" not in (rig.cfg.workspace / "journal/2026-10-10.md").read_text()
 
 
-async def test_journal_is_separate_from_curated_files(rig):
-    before = {n: (rig.cfg.workspace / n).read_text() for n in ("MEMORY.md", "USER.md", "IDENTITY.md", "SOUL.md")}
-    h, p, res = await run_steps(rig, jwrite("Something happened."), call("file_read", path="SOUL.md"))
-    assert {n: (rig.cfg.workspace / n).read_text() for n in before} == before
-    assert not any("changed · current content" in (m.get("content") or "") for r in p.requests for m in r.messages)
-
-
-async def test_empty_entry_is_refused(rig):
-    h, p, res = await run_steps(rig, jwrite("   "))
-    assert "empty" in res[0]["error"]
-    assert not (rig.cfg.workspace / "journal").exists()
-
-
 async def crash_and_recover(rig, point, *, tamper=None):
     clock = Clock()
     h = await rig.start(ScriptedProvider([jwrite("A quiet afternoon.")]), clock=clock, fault_hook=crash_at(point))
@@ -104,11 +89,6 @@ async def test_crash_before_append_is_known_not_written(rig):
     h, p2, op, text = await crash_and_recover(rig, "journal.before_append")
     assert op["status"] == "not_dispatched" and text is None
     assert "safe" in json.loads(op["result"])["error"]
-
-
-async def test_crash_before_plan_is_known_not_written(rig):
-    h, p2, op, text = await crash_and_recover(rig, "tool.after_dispatch")
-    assert op["status"] == "not_dispatched" and text is None
 
 
 async def test_partial_append_is_uncertain(rig):

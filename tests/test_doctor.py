@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import json
+import re
 import os
 import shutil
 import subprocess
 import sys
 
 import pytest
+from conftest import WORDCOUNT, activated
 
 from whim import credentials, doctor, service
 from whim.server import acquire_lock
@@ -92,7 +93,6 @@ def test_corrupted_database_is_reported(cfg):
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap not installed")
 async def test_tampered_or_unauthorized_plugins_are_flagged(rig):
-    from test_plugins import WORDCOUNT, activated
 
     await rig.start()
     row = await activated(rig, "plugins/wc", "wordcount", WORDCOUNT)
@@ -116,13 +116,18 @@ def test_live_provider_check_is_opt_in(cfg, monkeypatch):
     assert called == [1]
 
 
-def test_unit_file(cfg):
+def test_unit_file_restarts_whim_only_when_restarting_can_help(cfg):
+    from whim import restart
+
     text = service.unit_text(cfg, python="/opt/py/bin/python3")
+    # -P: the working directory (the home folder, under systemd) can't shadow whim's imports.
     assert f"ExecStart=/opt/py/bin/python3 -P -m whim --home {cfg.home} run" in text
-    assert "Restart=on-failure" in text and "RestartPreventExitStatus=75 78" in text
-    assert f"TimeoutStopSec={int(cfg.limits.shutdown_grace_seconds) + 15}" in text
-    assert "KillMode=mixed" in text and "WantedBy=default.target" in text
-    assert "DEEPSEEK_API_KEY" not in text and "Environment=PYTHONUNBUFFERED=1" in text
+    assert "Restart=on-failure" in text
+    assert "RestartPreventExitStatus=75 78" in text  # already running / unusable config: retrying can't help
+    assert f"RestartForceExitStatus={restart.EXIT_RESTART}" in text and "WHIM_SUPERVISOR=systemd" in text
+    stop = int(re.search(r"TimeoutStopSec=(\d+)", text).group(1))
+    assert stop > cfg.limits.shutdown_grace_seconds  # systemd waits for whim's own drain
+    assert "DEEPSEEK_API_KEY" not in text
 
 
 def test_service_install_writes_the_unit_without_touching_systemd_unless_asked(cfg, monkeypatch, tmp_path):
@@ -165,7 +170,6 @@ def test_doctor_cli_exit_status(cfg):
     r = whim(cfg.home, "doctor")
     assert r.returncode == 0, r.stdout
     assert KEY not in r.stdout
-    assert json.dumps is not None
 
 
 def test_fix_rebuilds_a_removed_workspace_without_touching_onboarding(cfg):

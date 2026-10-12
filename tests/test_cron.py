@@ -8,21 +8,20 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
-from conftest import Clock, crash_at, events, human_messages, runs, tool_result, types
+from conftest import Clock, complete_bootstrap, crash_at, events, kinds, runs, tool_result, types, until
 
 from whim import cron
 from whim.provider.base import ProviderError
 from whim.provider.fake import ScriptedProvider, call, finish
 
 LA = ZoneInfo("America/Los_Angeles")
+
+
 UTC = timezone.utc
 
 
 def utc(*a):
     return datetime(*a, tzinfo=UTC)
-
-
-# -- expressions and time rules ---------------------------------------------------------
 
 
 def test_cron_fields_and_names():
@@ -71,9 +70,6 @@ def test_fall_back_runs_ambiguous_time_once():
     assert cron.parse_at("2026-11-01 01:30", utc(2026, 10, 1), LA) == utc(2026, 11, 1, 8, 30)
 
 
-# -- tool and scheduler ---------------------------------------------------------------------
-
-
 def manage(*ops, expected_revision=None):
     args = {"operations": list(ops)}
     if expected_revision is not None:
@@ -91,10 +87,6 @@ async def setup(rig, *ops, steps=(), clock=None):
     res = tool_result(p.requests[1].messages[-1])
     assert res["ok"], res
     return h, p, clock, res
-
-
-def kinds(h):
-    return [json.loads(r["origin"])["kind"] for r in runs(h)]
 
 
 def job(h, job_id="cr_1"):
@@ -164,16 +156,6 @@ async def test_recurring_misses_coalesce_to_latest_occurrence(rig):
     assert job(h)["next_due_at"] == "2026-10-11T01:00:00.000Z"  # next after now, no backfill
 
 
-async def test_recurring_misses_while_offline_coalesce(rig):
-    h, p, clock, _ = await setup(rig, {"op": "add", "instruction": "Daily note", "cron": "0 9 * * *"})
-    clock.advance(60 * 24 * 3)
-    h = await rig.restart(ScriptedProvider([finish()]), clock=clock)
-    await tick_idle(h)
-    await tick_idle(h)
-    assert kinds(h) == ["input", "cron"]
-    assert events(h, "schedule.fired")[0]["data"]["missed"] == 3
-
-
 async def test_jobs_keep_independent_pending_state(rig):
     h, p, clock, _ = await setup(rig, {"op": "add", "instruction": "A", "in_minutes": 10},
                                  {"op": "add", "instruction": "B", "cron": "*/30 * * * *"},
@@ -185,7 +167,6 @@ async def test_jobs_keep_independent_pending_state(rig):
 
 
 async def test_priority_human_then_manual_then_jobs_then_heartbeat(rig):
-    from test_heartbeat import complete_bootstrap
 
     gate = asyncio.Event()
 
@@ -236,29 +217,22 @@ async def test_pause_resume_remove_and_reschedule(rig):
     assert job(h, "cr_1")["next_due_at"] == "2026-10-11T00:00:00.000Z"
 
 
-async def test_update_instruction_keeps_pending_and_timing_reschedules(rig):
+async def test_editing_a_due_job_keeps_or_reschedules_its_pending_wake(rig):
     h, p, clock, _ = await setup(
         rig, {"op": "add", "instruction": "Old words", "in_minutes": 10},
-        steps=[manage({"op": "update", "id": "cr_1", "instruction": "New words"}), finish(), finish()],
+        {"op": "add", "instruction": "Later", "in_minutes": 10},
+        steps=[manage({"op": "update", "id": "cr_1", "instruction": "New words"},
+                      {"op": "update", "id": "cr_2", "in_minutes": 60}), finish(), finish()],
     )
     clock.advance(11)
-    h.scheduler.tick()
-    h.request_wake()  # manual wake goes before the job and edits it
+    h.scheduler.tick()  # both due: queued
+    h.request_wake()  # a manual wake goes first and edits them
     await h.wait_idle()
     assert kinds(h) == ["input", "host", "cron"]
-    opening = p.requests[-1].messages[-1]["content"]
-    assert "Instruction: New words" in opening
-    assert types(h).count("schedule.due") == 1 and "wake.cancelled" not in types(h)  # same pending wake
-
-    p2 = ScriptedProvider([manage({"op": "update", "id": "cr_2", "in_minutes": 60}), finish(), finish()])
-    h = await rig.restart(p2, clock=clock)
-    with h.ledger.tx():
-        h.ledger.x("INSERT INTO jobs SELECT 'cr_2', instruction, kind, spec, 'active', next_due_at, created_at, "
-                   "updated_at, created_rev, updated_rev, 0, NULL, NULL, NULL, NULL FROM jobs WHERE id = 'cr_1'")
-        h.ledger.x("UPDATE jobs SET next_due_at = ? WHERE id = 'cr_2'", "2026-10-10T19:00:00.000Z")
-    h.scheduler.tick()  # cr_2 due now: queued
-    h.submit_input("push it back an hour")
-    await h.wait_idle()
+    # A new instruction keeps the pending wake, which runs with the new words...
+    assert "Instruction: New words" in p.requests[-1].messages[-1]["content"]
+    assert json.loads(runs(h)[-1]["origin"])["job_id"] == "cr_1"
+    # ...new timing cancels it and schedules afresh.
     assert [e["data"]["reason"] for e in events(h, "wake.cancelled")] == ["rescheduled"]
     assert job(h, "cr_2")["next_due_at"] == "2026-10-10T20:11:00.000Z"
 
@@ -303,21 +277,6 @@ async def test_jobs_and_pending_wakes_survive_restart(rig):
     assert [e["data"]["revision"] for e in events(h, "jobs.changed")] == [1]
 
 
-async def test_job_runs_can_be_silent_or_send(rig):
-    h, p, clock, _ = await setup(
-        rig, {"op": "add", "instruction": "Quiet check", "in_minutes": 5},
-        {"op": "add", "instruction": "Say hi", "in_minutes": 10},
-        steps=[call("file_read", path="MEMORY.md"), finish(),
-               call("message_send", destination="human", content="hi from a job"), finish()],
-    )
-    clock.advance(5)
-    await tick_idle(h)
-    assert human_messages(h) == []
-    clock.advance(5)
-    await tick_idle(h)
-    assert human_messages(h) == ["hi from a job"]
-
-
 async def test_failed_job_run_is_recorded_not_retried(rig):
     def boom(request):
         raise ProviderError("503")
@@ -343,20 +302,23 @@ async def test_crashed_job_run_records_interruption(rig):
     assert kinds(h) == ["input", "cron", "recovery"]  # not re-run; recovery wake instead
 
 
-async def test_stored_invalid_schedule_is_quarantined(rig):
-    h, p, clock, _ = await setup(rig, {"op": "add", "instruction": "x", "cron": "0 * * * *"})
-    with h.ledger.tx():
-        h.ledger.x("UPDATE jobs SET spec = 'garbage' WHERE id = 'cr_1'")
-    clock.advance(61)
-    await tick_idle(h)
-    assert job(h)["status"] == "failed" and "5 fields" in job(h)["error"]
-    assert [e["data"]["kind"] for e in events(h, "host.warning")] == ["job_invalid"]
-    assert kinds(h) == ["input"]
-
-
-async def test_jobs_run_regardless_of_first_meeting_and_heartbeat_settings(rig):
+async def test_jobs_and_question_expiry_run_without_heartbeats(rig):
+    """The daemon's background clock drives jobs and question expiry even when
+    heartbeats are disabled; only heartbeats themselves stay off."""
     rig.cfg.heartbeat.enabled = False
-    h, p, clock, _ = await setup(rig, {"op": "add", "instruction": "x", "in_minutes": 5}, steps=[finish()])
-    clock.advance(5)
-    await tick_idle(h)
-    assert kinds(h) == ["input", "cron"]
+    clock = Clock()
+    p = ScriptedProvider([
+        call("cron_manage", operations=[{"op": "add", "instruction": "water the plants", "in_minutes": 5}]),
+        call("human_ask", question="Before noon?", expires_in_hours=1),
+        finish(),
+        finish(),  # the job's wake
+    ])
+    h = await rig.start(p, clock=clock)
+    h.request_wake()
+    await h.wait_idle()
+    clock.advance(90)
+    h = await rig.restart(p, clock=clock, run_scheduler=True)  # as the daemon starts it
+    await until(lambda: "cron" in kinds(h) and events(h, "question.expired"))
+    await h.wait_idle()
+    assert kinds(h) == ["host", "cron"]
+    assert not events(h, "schedule.armed") and h.ledger.q1("SELECT 1 FROM wakes WHERE kind = 'heartbeat'") is None

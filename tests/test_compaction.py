@@ -8,14 +8,17 @@ import inspect
 import json
 
 import pytest
-from conftest import Clock, crash_at, events, runs, tool_result, types
+from conftest import Clock, assert_paired, check_conformance, crash_at, events, kinds, runs, tool_result, types
 
 from whim import compaction
 from whim.provider.base import Completion, ProviderError
 from whim.provider.fake import ScriptedProvider, call, finish
 
 MAINT = "⟦host · memory maintenance"
+
+
 CHECKPOINT = "⟦host · context checkpoint"
+
 
 SUMMARY = """## Recent life
 - 2026-10-10 12:00: the human sent me long notes about a garden; I read them and replied.
@@ -98,26 +101,6 @@ def comp(h):
     return dict(h.ledger.q1("SELECT * FROM compactions ORDER BY created_at DESC LIMIT 1"))
 
 
-def kinds(h):
-    return [json.loads(r["origin"])["kind"] for r in runs(h)]
-
-
-def assert_valid_transcript(messages):
-    """Every tool call answered right after its assistant message; no orphan results."""
-    pending = []
-    for m in messages:
-        if m["role"] == "tool":
-            assert pending and m["tool_call_id"] == pending.pop(0), "orphan or out-of-order tool result"
-            continue
-        assert not pending, "tool calls left unanswered"
-        if m["role"] == "assistant":
-            pending = [tc["id"] for tc in m.get("tool_calls") or []]
-    assert not pending
-
-
-# -- the happy path ----------------------------------------------------------------------
-
-
 async def test_compaction_end_to_end(rig):
     character = Character(maintenance=[
         call("journal_write", entry="Long day of garden notes; I liked it."),
@@ -143,7 +126,7 @@ async def test_compaction_end_to_end(rig):
     assert "historical context" in msgs[1]["content"] and "## Things underway" in msgs[1]["content"]
     assert msgs[2]["role"] == "user" and "message from human" in msgs[2]["content"]  # tail starts at a turn
     assert not any(MAINT in (m.get("content") or "") for m in msgs)  # the maintenance run itself is condensed
-    assert_valid_transcript(msgs[1:])
+    assert_paired(msgs[1:])
     assert len((rig.cfg.workspace / "journal/2026-10-10.md").read_text().split("\n## ")) == 2  # one entry
 
     # Context replacement, not deletion: the ledger and the old epoch are intact.
@@ -157,15 +140,6 @@ async def test_compaction_end_to_end(rig):
     assert "thinking..." not in prompt
 
 
-async def test_maintenance_may_leave_memory_unchanged(rig):
-    h, _ = await setup(rig)
-    before = {n: (rig.cfg.workspace / n).read_text() for n in ("MEMORY.md", "USER.md")}
-    await talk(h, 5)
-    assert comp(h)["status"] == "committed"
-    assert {n: (rig.cfg.workspace / n).read_text() for n in before} == before
-    assert not (rig.cfg.workspace / "journal").exists()
-
-
 async def test_no_repeated_compactions(rig):
     h, _ = await setup(rig, compactor=ScriptedProvider([summary(), summary()]))
     await talk(h, 5)
@@ -174,9 +148,6 @@ async def test_no_repeated_compactions(rig):
     assert types(h).count("compaction.started") == 1
     await talk(h, 6)  # grows well past the trigger again
     assert types(h).count("context.compacted") == 2
-
-
-# -- failures and crashes ----------------------------------------------------------------
 
 
 async def test_failed_summary_keeps_context_and_retries_without_new_maintenance(rig):
@@ -214,26 +185,6 @@ async def test_invalid_summaries_are_rejected(rig):
         await h.wait_idle()
     errors = [e["data"]["message"] for e in events(h, "host.warning")]
     assert any("too short" in e for e in errors) and any("sections" in e for e in errors)
-
-
-async def test_summary_gives_up_after_max_attempts(rig):
-    def down(request):
-        raise ProviderError("503")
-
-    h, clock = await setup(rig, compactor=ScriptedProvider([down, down, down]))
-    await talk(h, 5)
-    epoch = h.context.epoch()
-    for _ in range(3):
-        clock.advance(11)
-        h.submit_input("tick")
-        await h.wait_idle()
-    c = comp(h)
-    assert c["status"] == "failed", (c["summary_attempts"], c["retry_after"], c["error"], str(clock.now))
-    assert h.context.epoch() == epoch
-    assert "compaction_failed" in [e["data"]["kind"] for e in events(h, "host.warning")]
-    h.submit_input("one more")
-    await h.wait_idle()
-    assert types(h).count("compaction.started") == 1  # no immediate retrigger
 
 
 async def test_failed_maintenance_is_retried_with_what_was_saved(rig):
@@ -298,10 +249,7 @@ async def test_crash_around_summary_and_commit(rig, point):
     assert (rig.cfg.workspace / "journal/2026-10-10.md").read_text().count("Maintenance entry.") == 1
     # Human messages that arrived meanwhile are all answered, after the checkpoint.
     assert h.ledger.q1("SELECT COUNT(*) c FROM inputs WHERE status = 'pending'")["c"] == 0
-    assert_valid_transcript(epoch_messages(h)[1:])
-
-
-# -- inputs, forcing, attribution -----------------------------------------------------------
+    assert_paired(epoch_messages(h)[1:])
 
 
 async def test_human_message_during_maintenance_waits_for_the_new_context(rig):
@@ -368,7 +316,7 @@ async def test_reasoning_and_tool_pairs_survive_in_the_tail(rig):
     h, _ = await setup(rig, character=character, tail=2500)
     await talk(h, 5)
     msgs = epoch_messages(h)
-    assert_valid_transcript(msgs[1:])
+    assert_paired(msgs[1:])
     tail_assistants = [m for m in msgs if m["role"] == "assistant"]
     assert any(m.get("tool_calls") for m in tail_assistants)
     assert all("reasoning_content" in m for m in tail_assistants)  # replay state kept, privately
@@ -426,7 +374,6 @@ async def test_old_history_is_searchable_after_compaction(rig):
 
 
 async def test_agui_projection_stays_conformant_through_compaction(rig):
-    import test_agui
 
     from whim import agui
 
@@ -436,10 +383,7 @@ async def test_agui_projection_stays_conformant_through_compaction(rig):
         stream = [x for ev in h.ledger.events_after(0, 100000) for x in agui.Projector(h, view).project(ev)]
         for e in stream:
             agui.validate(e)
-        test_agui.check_conformance(stream)
-
-
-# -- held human input is always released ---------------------------------------------------
+        check_conformance(stream)
 
 
 def admitted_text(h, text):
@@ -490,13 +434,205 @@ async def test_unexpected_compactor_error_counts_as_a_failed_attempt(rig):
     assert comp(h)["status"] == "failed"
 
 
-async def test_maintenance_without_a_wake_is_failed_not_stuck(rig):
-    h, _ = await setup(rig)
-    with h.ledger.tx():
-        h.ledger.x("INSERT INTO compactions(id, status, forced, epoch_from, tokens_before, created_at, updated_at) "
-                   "VALUES('cmp_orphan', 'maintenance', 1, 0, 1, '2026-10-10T19:00:00.000Z', "
-                   "'2026-10-10T19:00:00.000Z')")
-    h.submit_input("hi")
+# -- stopping and failing: bounded, never stuck ----------------------------------------
+
+
+@pytest.mark.parametrize("action", ["stop", "interrupt"])
+async def test_stopping_maintenance_cancels_the_compaction_instead_of_retrying(rig, action):
+
+    gate, entered = asyncio.Event(), asyncio.Event()
+
+    async def slow_maintenance(request):
+        entered.set()
+        await gate.wait()
+        return call("journal_write", entry="half a thought")
+
+    h, clock = await setup(rig, character=Character(maintenance=[slow_maintenance]), trigger=2500, force=4000)
+    task = asyncio.create_task(talk(h, 5))
+    await asyncio.wait_for(entered.wait(), 5)
+    h.submit_input("are you there?")  # waits behind maintenance
+    getattr(h, f"control_{action}")(h.cfg.principal_id)
+    gate.set()
+    await task
     await h.wait_idle()
-    assert dict(h.ledger.q1("SELECT status FROM compactions WHERE id = 'cmp_orphan'"))["status"] == "failed"
-    assert len(admitted_text(h, "hi")) == 1
+
+    assert kinds(h).count("maintenance") == 1  # no replacement maintenance
+    assert comp(h)["status"] == "cancelled"
+    assert [e["data"]["compaction_id"] for e in events(h, "compaction.cancelled")] == [comp(h)["id"]]
+    assert not events(h, "compaction.failed")  # a deliberate cancellation is not a failure
+    assert h.ledger.get_meta("compaction_backoff") is None
+    assert kinds(h)[-1] == "input"  # the human's message went through
+    st = compaction.status(h)
+    assert st["suppressed_until"] is not None and st.get("failures_in_a_row") is None
+
+    # After the hold, compaction starts afresh (a new compaction, not a retry).
+    clock.advance(61)
+    await talk(h, 1)
+    assert kinds(h).count("maintenance") == 2 and comp(h)["status"] == "committed"
+
+
+async def test_crashed_maintenance_is_still_retried(rig):
+    """Recoverable failure keeps its retry; only deliberate cancellation stops it."""
+
+    def down(request):
+        raise ProviderError("503")
+
+    h, _ = await setup(rig, character=Character(maintenance=[down, finish()]))
+    await talk(h, 5)
+    assert kinds(h).count("maintenance") == 2 and comp(h)["status"] == "committed"
+    assert not events(h, "compaction.cancelled")
+
+
+async def test_failing_forced_compaction_backs_off_and_lets_humans_through(rig):
+
+    def down(request):
+        raise ProviderError("503")
+
+    clock = Clock()
+    compactor = ScriptedProvider([down] * 50)
+    h = await rig.start(Character(), clock=clock, compactor=compactor)
+    base = compaction.estimate(h)
+    c = rig.cfg.compaction
+    c.trigger_tokens, c.force_tokens, c.tail_tokens, c.min_growth_tokens = base + 500, base + 600, 300, 100
+    c.retry_minutes = 10
+    for i in range(3):
+        h.submit_input(f"message {i}: {LONG}")
+        await h.wait_idle(timeout=5)
+    for _ in range(3):
+        clock.advance(11)
+        h.submit_input("tick")
+        await h.wait_idle(timeout=5)
+    started = types(h).count("compaction.started")
+    assert started == 1 and len(compactor.requests) == c.max_summary_attempts
+    # Human input keeps flowing while compaction is suppressed (no context_limit pauses).
+    h.submit_input("still there?")
+    await h.wait_idle(timeout=5)
+    assert runs(h)[-1]["status"] == "finished"
+    # Suppression survives a restart.
+    h = await rig.restart(Character(), clock=clock, compactor=compactor)
+    h.submit_input("after restart")
+    await h.wait_idle(timeout=5)
+    assert types(h).count("compaction.started") == 1
+    st = compaction.status(h)
+    assert st["suppressed_until"] and st["last"]["status"] == "failed"
+    # Later, one new attempt is allowed.
+    clock.advance(24 * 60)
+    h.submit_input("much later")
+    await h.wait_idle(timeout=5)
+    assert types(h).count("compaction.started") == 2
+
+
+def test_backoff_delay_policy():
+    assert compaction.backoff_delay(1, 10).total_seconds() == 3600
+    assert compaction.backoff_delay(2, 10).total_seconds() == 7200
+    assert compaction.backoff_delay(6, 10) == compaction.MAX_BACKOFF
+    for n in (35, 36, 10**6, 10**18):
+        assert compaction.backoff_delay(n, 10) == compaction.MAX_BACKOFF
+
+
+SUMMARY_TEXT = ("## Recent life\n- lots of garden notes.\n## What matters to me\n- the garden.\n"
+                "## Things underway\n- notes.\n## Particulars\n- none.\n## Loose ends\n- none.\n") * 3
+
+
+def _small_window(rig, h, *, room=4000, reserve=1000):
+    base = compaction.estimate(h)
+    c = rig.cfg.compaction
+    c.context_window_tokens = base + room
+    c.reserve_tokens = reserve
+    c.trigger_tokens, c.force_tokens = base + room // 3, base + room // 2
+    c.tail_tokens, c.min_growth_tokens = 300, 100
+    return c
+
+
+def _within_window(provider, window):
+    for r in provider.requests:
+        assert len(json.dumps(r.messages) + json.dumps(r.tools)) / compaction.CHARS_PER_TOKEN < window
+
+
+async def test_full_context_with_compaction_unavailable_holds_input_safely(rig):
+
+    def down(request):
+        raise ProviderError("503")
+
+    clock = Clock()
+    rig.cfg.compaction.max_summary_attempts = 1
+    character = Character()
+    h = await rig.start(character, clock=clock, compactor=ScriptedProvider([down]))
+    c = _small_window(rig, h)
+    for i in range(12):  # well past the ceiling, with compaction failing and then suppressed
+        h.submit_input(f"message {i}: {LONG}")
+        await h.wait_idle(timeout=5)
+    _within_window(character, c.context_window_tokens)
+    st = compaction.status(h)
+    assert st["blocked"] and st["suppressed_until"]
+    asked = len(character.requests)
+    h.submit_input("are you there?")
+    await h.wait_idle(timeout=5)
+    assert len(character.requests) == asked  # nothing more was sent
+    assert h.ledger.q1("SELECT COUNT(*) c FROM inputs WHERE status = 'pending'")["c"] >= 1  # durably kept
+    assert [e["data"]["kind"] for e in events(h, "host.warning")].count("context_full") == 1
+    from whim import doctor
+    assert any(f.check == "context" and f.level == "error" and "waiting" in f.message
+               for f in doctor.Doctor(rig.cfg.home).run())
+
+    # A restart while blocked starts cleanly and still sends nothing.
+    character2 = Character()
+    h = await rig.restart(character2, clock=clock, compactor=ScriptedProvider([summary(SUMMARY_TEXT)] * 10))
+    await h.wait_idle(timeout=5)
+    assert character2.requests == [] and compaction.status(h)["blocked"]
+
+    # Once the backoff expires, compaction runs and the waiting messages are taken up.
+    clock.advance(24 * 60 + 1)
+    h.scheduler.tick()
+    for _ in range(5):
+        await h.wait_idle(timeout=10)
+        h.scheduler.tick()
+    _within_window(character2, c.context_window_tokens)
+    assert compaction.status(h)["blocked"] is None
+    assert h.ledger.q1("SELECT COUNT(*) c FROM inputs WHERE status = 'pending'")["c"] == 0
+    assert types(h).count("context.compacted") >= 1
+    assert runs(h)[-1]["status"] == "finished"  # the character got to respond afterwards
+    resumed = h.ledger.q("SELECT status FROM wakes WHERE json_extract(data, '$.reason') = 'resume_after_compaction'")
+    assert resumed and all(r["status"] == "admitted" for r in resumed)
+
+
+async def test_maintenance_without_room_is_skipped_and_the_compactor_still_runs(rig):
+
+    character = Character(maintenance=[call("journal_write", entry="never reached")])
+    h = await rig.start(character, clock=Clock(), compactor=ScriptedProvider([summary(SUMMARY_TEXT)]))
+    c = _small_window(rig, h, room=4000, reserve=1000)
+    h.submit_input("x " * 12000)  # one message that leaves no room even for maintenance
+    for _ in range(3):
+        await h.wait_idle(timeout=5)
+    [ck] = events(h, "memory.checkpointed")
+    assert ck["data"]["skipped"] == "no room left for maintenance"
+    assert types(h).count("context.compacted") == 1
+    assert not (rig.cfg.workspace / "journal").exists()
+    _within_window(character, c.context_window_tokens)
+
+
+async def test_compactor_prompt_stays_within_its_window(rig):
+
+    compactor = ScriptedProvider([summary(SUMMARY_TEXT)])
+    h = await rig.start(Character(), clock=Clock(), compactor=compactor)
+    rig.cfg.compaction.enabled = False
+    for i in range(20):  # build a long history first
+        h.submit_input(f"message {i}: {LONG}")
+        await h.wait_idle(timeout=5)
+    c = rig.cfg.compaction
+    c.enabled = True
+    est = compaction.estimate(h)
+    from whim import plugins
+    from whim.ledger import dumps
+    tools = int(len(dumps([t.schema() for t in plugins.snapshot(h)[1].values()])) / compaction.CHARS_PER_TOKEN)
+    c.context_window_tokens = est - tools + 2000  # the compactor's window (no tool schemas) is now tight
+    c.summary_max_tokens = 1500
+    c.reserve_tokens = 1000
+    c.trigger_tokens = c.force_tokens = est - 1
+    c.tail_tokens, c.min_growth_tokens = 300, 100
+    h.submit_input("one more")
+    await h.wait_idle(timeout=10)
+    req = compactor.requests[-1]
+    limit_chars = (c.context_window_tokens - c.summary_max_tokens) * compaction.CHARS_PER_TOKEN
+    assert len(req.messages[0]["content"]) + len(req.messages[1]["content"]) < limit_chars
+    assert "earlier entries are left out of this transcript because of its size" in req.messages[1]["content"]

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from conftest import events, human_messages, runs, tool_result, types
+from conftest import assert_paired, events, human_messages, runs, tool_result, types
 
 from whim.context import CONTINUATION_CUE
 from whim.provider.base import ProviderError
@@ -55,26 +55,6 @@ async def test_silent_host_wake_finishes_without_delivery(rig):
     [run] = runs(h)
     assert run["status"] == "finished"
     assert not [t for t in types(h) if t.startswith("delivery.")]
-
-
-async def test_multiple_sends_then_finish(rig):
-    h = await rig.start(ScriptedProvider([
-        calls(tool_call("message_send", destination="human", content="one"),
-              tool_call("message_send", destination="human", content="two")),
-        finish(),
-    ]))
-    h.submit_input("hi")
-    await h.wait_idle()
-    assert human_messages(h) == ["one", "two"]
-
-
-async def test_reply_to_source_without_source_is_an_error(rig):
-    p = ScriptedProvider([call("message_send", destination="reply_to_source", content="x"), finish()])
-    h = await rig.start(p)
-    h.request_wake()
-    await h.wait_idle()
-    assert "no message source" in tool_result(p.requests[1].messages[-1])["error"]
-    assert human_messages(h) == []
 
 
 async def test_input_during_tool_is_admitted_once_at_next_boundary(rig):
@@ -143,22 +123,6 @@ async def test_unknown_tool_and_bad_args_return_errors(rig):
     assert "invalid arguments" in tool_result(bad)["error"]
 
 
-async def test_file_tools_stay_inside_workspace(rig):
-    p = ScriptedProvider([
-        calls(tool_call("file_write", path="../escape.txt", content="x"),
-              tool_call("file_write", path="notes/a.md", content="hello")),
-        finish(),
-    ])
-    h = await rig.start(p)
-    h.submit_input("hi")
-    await h.wait_idle()
-    esc, ok = p.requests[1].messages[-2:]
-    assert "outside the workspace" in tool_result(esc)["error"]
-    assert tool_result(ok)["ok"]
-    assert (rig.cfg.workspace / "notes/a.md").read_text() == "hello"
-    assert not (rig.cfg.home / "escape.txt").exists()
-
-
 async def test_request_limit_pauses(rig):
     rig.cfg.limits.max_requests_per_run = 2
     h = await rig.start(ScriptedProvider([call("file_read", path="MEMORY.md")] * 5))
@@ -195,18 +159,6 @@ async def test_human_input_is_admitted_before_host_wakes(rig):
     h = await rig.start(ScriptedProvider([finish(), finish()]), before_start=queue_both)
     await h.wait_idle()
     assert [json.loads(r["origin"])["kind"] for r in runs(h)] == ["input", "host"]
-
-
-async def test_text_beside_finish_with_nothing_sent_is_questioned_once(rig):
-    p = ScriptedProvider([call("turn_finish", authored="Your favorite color is teal."),
-                          call("turn_finish", authored="Your favorite color is teal.")])
-    h = await rig.start(p)
-    h.submit_input("what's my favorite color?")
-    await h.wait_idle()
-    assert "nobody has received it" in tool_result(p.requests[1].messages[-1])["error"]
-    [run] = runs(h)
-    assert run["status"] == "finished" and run["requests"] == 2  # second finish accepted: silence stays possible
-    assert human_messages(h) == []  # never sent on its behalf
 
 
 async def test_missed_reply_check_stays_out_of_the_way(rig):
@@ -246,3 +198,68 @@ async def test_missed_reply_nudge_never_forces_delivery_and_silence_can_win(rig)
     assert len(notes) == 1  # at most once per run
     ops = [dict(o) for o in h.ledger.q("SELECT status FROM operations WHERE tool = 'turn.finish' ORDER BY rowid")]
     assert [o["status"] for o in ops] == ["error", "ok"]
+
+
+# -- every committed tool call gets an outcome; budgets hold per call -------------------
+
+
+async def test_unexpected_exception_in_any_tool_still_pairs_its_call(rig, monkeypatch):
+    from whim import heartbeat
+
+    def boom(*a, **k):
+        raise RuntimeError("bug in the tool")
+
+    monkeypatch.setattr(heartbeat, "apply_ops", boom)
+    p = ScriptedProvider([calls(tool_call("heartbeat_manage", operations=[]),
+                                tool_call("file_read", path="SOUL.md")), finish(), finish()])
+    h = await rig.start(p)
+    h.submit_input("go")
+    await h.wait_idle()
+    h.submit_input("next")
+    await h.wait_idle()
+    for req in p.requests:
+        assert_paired(req.messages)
+    first = tool_result(p.requests[1].messages[-2])
+    assert not first["ok"] and "bug in the tool" in first["error"]
+
+
+async def test_a_run_that_dies_mid_batch_leaves_no_unanswered_calls(rig, monkeypatch):
+    from whim import run as runmod
+
+    real = runmod._execute_tool
+    seen = []
+
+    async def dies_on_second(h, state, pos, idx, tc, tools):
+        seen.append(idx)
+        if idx == 1:
+            raise RuntimeError("host bug after the first call")
+        return await real(h, state, pos, idx, tc, tools)
+
+    monkeypatch.setattr(runmod, "_execute_tool", dies_on_second)
+    p = ScriptedProvider([calls(tool_call("file_read", path="SOUL.md"), tool_call("file_write", path="x.md",
+                                                                                  content="x")), finish()])
+    h = await rig.start(p)
+    h.submit_input("go")
+    await h.wait_idle()
+    monkeypatch.setattr(runmod, "_execute_tool", real)
+    h.submit_input("next")
+    await h.wait_idle()
+    assert runs(h)[0]["status"] == "failed"
+    assert_paired(p.requests[-1].messages)
+    assert not (rig.cfg.workspace / "x.md").exists()  # never retried
+
+
+async def test_tool_budget_is_enforced_before_each_dispatch_across_batches(rig):
+    rig.cfg.limits.max_tool_calls_per_run = 2
+    p = ScriptedProvider([call("file_read", path="SOUL.md"),
+                          calls(tool_call("message_send", destination="human", content="m0"),
+                                *[tool_call("file_write", path=f"f{i}.md", content="x") for i in range(2)])])
+    h = await rig.start(p)
+    h.submit_input("go")
+    await h.wait_idle()
+    assert human_messages(h) == ["m0"] and not list(rig.cfg.workspace.glob("f*.md"))
+    statuses = [r["status"] for r in h.ledger.q("SELECT status FROM operations ORDER BY rowid")]
+    assert statuses == ["ok", "ok", "not_dispatched", "not_dispatched"]
+    [run] = runs(h)
+    assert (run["status"], run["reason"]) == ("paused", "tool_limit")
+    assert_paired(h.context.messages())

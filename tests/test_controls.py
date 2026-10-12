@@ -6,7 +6,7 @@ import asyncio
 import json
 
 import pytest
-from conftest import events, human_messages, runs, tool_result, types
+from conftest import events, human_messages, kinds, runs, served, types
 
 from whim import authz
 from whim.provider.fake import ScriptedProvider, call, calls, finish, tool_call
@@ -40,10 +40,6 @@ class SlowOutbox:
         await self.release.wait()
         self.sent.append(content)
         return {}
-
-
-def kinds(h):
-    return [json.loads(r["origin"])["kind"] for r in runs(h)]
 
 
 async def test_status_shows_what_the_run_is_doing(rig):
@@ -193,7 +189,6 @@ async def test_controls_need_the_authenticated_human(rig):
 
 
 async def test_control_endpoint_is_operator_only(rig):
-    from test_server import served
 
     gate = Gate(call("file_read", path="MEMORY.md"))
     h = await rig.start(ScriptedProvider([gate]))
@@ -241,4 +236,3 @@ async def test_a_finish_already_in_flight_still_counts_as_the_characters_own(rig
     gate.release.set()
     await h.wait_idle()
     assert (runs(h)[0]["status"], runs(h)[0]["reason"]) == ("finished", "turn_finish")
-    assert tool_result is not None

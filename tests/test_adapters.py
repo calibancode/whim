@@ -7,33 +7,15 @@ from __future__ import annotations
 import json
 
 import pytest
-from conftest import crash_at, events, runs, tool_result
+from conftest import (
+    WORDCOUNT, TestChat, crash_at, events, plugin_manage, project_all, read_sse, runs, served, tool_result,
+    write_plugin,
+)
 from pydantic import BaseModel, ConfigDict
 
 from whim import agui
-from whim.delivery import DeliveryFailed
 from whim.provider.fake import ScriptedProvider, call, finish
 from whim.tools.registry import Tool, ToolResult
-
-
-class TestChat:
-    """A pretend chat platform: verifies senders, delivers to rooms."""
-
-    __test__ = False
-    name = "testchat"
-    description = "test chat platform"
-
-    def __init__(self, mode="ok"):
-        self.mode = mode
-        self.sent = []
-
-    async def deliver(self, delivery_id, content, reply_to, target=None):
-        if self.mode == "reject":
-            raise DeliveryFailed("room is read-only")
-        if self.mode == "explode":
-            raise ConnectionError("socket closed mid-send")
-        self.sent.append((target, content))
-        return {"platform_message_id": f"tc-{len(self.sent)}"}
 
 
 async def start(rig, steps, mode="ok", **kw):
@@ -68,14 +50,6 @@ async def test_reply_goes_back_through_the_adapter_with_each_outcome(rig, mode, 
     if mode == "ok":
         assert chat.sent == [("garden", "hi Alice")]
         assert settled["data"]["receipt"] == {"platform_message_id": "tc-1"}
-
-
-async def test_character_can_message_an_adapter_room_from_any_wake(rig):
-    h, chat, adapter = await start(rig, [call("message_send", destination="testchat:lobby", content="morning all"),
-                                         finish()])
-    h.request_wake()
-    await h.wait_idle()
-    assert chat.sent == [("lobby", "morning all")]
 
 
 async def test_crash_before_the_platform_receipt_is_uncertain_and_not_resent(rig):
@@ -122,11 +96,10 @@ async def test_adapter_tool_joins_the_catalog_hot(rig):
 
 
 async def test_external_senders_cannot_approve_or_reach_private_views(rig):
-    from test_plugins import WORDCOUNT, manage, write_plugin
 
     write_plugin(rig, "plugins/wc", "wordcount", WORDCOUNT)
     h, chat, adapter = await start(rig, [
-        manage("install", path="plugins/wc"), manage("activate", name="wordcount"), finish(),
+        plugin_manage("install", path="plugins/wc"), plugin_manage("activate", name="wordcount"), finish(),
         call("message_send", destination="reply_to_source", content="noted"), finish(),
     ])
     h.submit_input("make a counter")
@@ -149,3 +122,38 @@ async def test_external_senders_cannot_approve_or_reach_private_views(rig):
     human_only = [x for ev in h.ledger.events_after(0, 100000)
                   for x in agui.Projector(h, "inspect", ("human",)).project(ev)]
     assert not any("I'm your human" in json.dumps(e) for e in human_only)
+
+
+async def test_verified_sender_attribution_is_published_to_entitled_viewers(rig):
+
+    h, chat, adapter = await start(rig, [call("message_send", destination="reply_to_source", content="hi Alice"),
+                                         finish(), finish()])
+    adapter.submit(sender_id="u-42", sender_name="Alice", channel="garden", text="hello!", message_id="m1")
+    await h.wait_idle()
+    [ev] = events(h, "input.received")
+    assert ev["data"]["sender"] == {"role": "external", "verified_by": "adapter:testchat", "id": "u-42",
+                                    "name": "Alice", "label": "Alice (testchat)", "channel": "garden"}
+    assert ev["data"]["reply_destination"] == "testchat:garden"
+    assert ev["audience"] == "operator" and "principal_id" not in ev["origin"]  # never the human's authority
+    [req] = events(h, "delivery.requested")
+    assert req["data"]["destination"] == "testchat:garden" and req["data"]["requested_as"] == "reply_to_source"
+
+    # AG-UI: the operator's activity view carries the attribution on the user message.
+    [start_ev] = [e for e in project_all(h, "activity") if e["type"] == "TEXT_MESSAGE_START" and e["role"] == "user"]
+    assert start_ev["name"] == "Alice (testchat)"
+    assert start_ev["metadata"]["whim"]["sender"]["id"] == "u-42"
+    assert start_ev["metadata"]["whim"]["reply_destination"] == "testchat:garden"
+
+    # The designated human's direct messages are attributed by the host, never the body.
+    async with served(h) as c:
+        await c.post("/v1/input", {"text": "me", "sender": {"role": "external", "id": "spoof"},
+                                   "origin": {"principal_id": "x"}})
+        await h.wait_idle()
+        direct = events(h, "input.received")[-1]
+        assert direct["data"]["sender"] == {"role": "designated_human", "verified_by": "direct", "label": "human"}
+        assert direct["data"]["reply_destination"] == "human"
+    # A viewer without operator entitlement never sees the external sender.
+    async with served(h, entitlements=frozenset({"human"})) as c:
+        native = [e for _, e in await read_sse(c, "/v1/events?follow=0") if e]
+        projected = [e for _, e in await read_sse(c, "/v1/agui?view=inspect&follow=0") if e]
+    assert "u-42" not in json.dumps(native + projected) and "Alice" not in json.dumps(native + projected)

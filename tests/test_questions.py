@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
-from conftest import Clock, events, human_messages, runs, tool_result, types
+from conftest import (
+    WORDCOUNT, Clock, crash_at, events, human_messages, kinds, plugin_manage, runs, served, tool_result, types,
+    write_plugin,
+)
 
-from whim import agui, authz, questions
+from whim import authz, questions
 from whim.provider.fake import ScriptedProvider, call, finish
 
 
@@ -17,10 +18,6 @@ def ask(**kw):
 
 def qid(h):
     return h.ledger.q1("SELECT id FROM questions ORDER BY rowid DESC LIMIT 1")["id"]
-
-
-def kinds(h):
-    return [json.loads(r["origin"])["kind"] for r in runs(h)]
 
 
 async def test_asking_returns_at_once_and_the_run_finishes(rig):
@@ -119,10 +116,9 @@ async def test_expiry_is_noticed_on_the_next_wake(rig):
 
 
 async def test_answering_yes_never_approves_anything(rig):
-    from test_plugins import WORDCOUNT, manage, write_plugin
 
     write_plugin(rig, "plugins/wc", "wordcount", WORDCOUNT)
-    p = ScriptedProvider([manage("install", path="plugins/wc"), manage("activate", name="wordcount"),
+    p = ScriptedProvider([plugin_manage("install", path="plugins/wc"), plugin_manage("activate", name="wordcount"),
                           ask(question="May I activate my word counter?", choices=["yes", "no"]), finish(), finish()])
     h = await rig.start(p)
     h.submit_input("make a counter")
@@ -148,27 +144,7 @@ async def test_messages_mentioning_a_question_do_not_answer_it(rig):
     assert h.ledger.q1("SELECT status FROM questions")["status"] == "pending"
 
 
-async def test_agui_shows_questions_and_correlated_answers(rig):
-    import test_agui
-
-    p = ScriptedProvider([ask(question="Tea or coffee?", choices=["tea", "coffee"]), finish(), finish()])
-    h = await rig.start(p)
-    h.request_wake()
-    await h.wait_idle()
-    h.answer_question(qid(h), h.cfg.principal_id, choice=1)
-    await h.wait_idle()
-    stream = [x for ev in h.ledger.events_after(0, 100000) for x in agui.Projector(h, "conversation").project(ev)]
-    for e in stream:
-        agui.validate(e)
-    test_agui.check_conformance(stream)
-    [card] = [e for e in stream if e["type"] == "CUSTOM" and e["name"] == "whim.question.created"]
-    assert card["value"]["choices"] == ["tea", "coffee"]
-    [answer] = [e for e in stream if e["type"] == "TEXT_MESSAGE_START" and e["role"] == "user"]
-    assert answer["metadata"]["whim"]["question_id"] == card["value"]["question_id"]
-
-
 async def test_answer_endpoint_requires_the_human(rig):
-    from test_server import served
 
     p = ScriptedProvider([ask(question="Ok?"), finish(), finish()])
     h = await rig.start(p)
@@ -186,3 +162,20 @@ async def test_answer_endpoint_requires_the_human(rig):
         assert status == 409 and "already answered" in data["error"]
         status, _ = await c.try_post("/v1/questions/q_nope/answer", {"text": "x"})
         assert status == 404
+
+
+async def test_question_delivery_association_survives_a_crash(rig):
+
+    h = await rig.start(ScriptedProvider([call("human_ask", question="Tea or coffee?", choices=["tea", "coffee"])]),
+                        fault_hook=crash_at("question.after_delivery"))
+    h.request_wake()
+    await rig.crashed()
+    h = await rig.start(ScriptedProvider([finish()]))
+    await h.wait_idle()
+    q = h.ledger.q1("SELECT id, delivery_id FROM questions")
+    [settled] = [e for e in events(h, "delivery.settled") if e["data"].get("question_id")]
+    assert settled["data"]["question_id"] == q["id"] and q["delivery_id"] == settled["data"]["delivery_id"]
+    async with served(h) as c:
+        snap = await c.get("/v1/snapshot")
+    [shown] = [m for m in snap["messages_to_human"] if m["id"] == q["delivery_id"]]
+    assert shown["question_id"] == q["id"]  # snapshot agrees with the event history

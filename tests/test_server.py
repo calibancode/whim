@@ -1,31 +1,15 @@
-"""Direct interface over a real Unix socket: auth, attribution, SSE replay."""
+"""The control socket: peer authentication, attribution, the event stream's guarantees,
+and the self-management endpoints."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-from contextlib import asynccontextmanager
 
-from aiohttp import web
-from conftest import events
+from conftest import events, read_sse, served, until
 
-from whim.cli import Client
-from whim.provider.fake import ScriptedProvider, call, finish
-from whim.server import make_app, peer_uid
-
-
-@asynccontextmanager
-async def served(h, **kw):
-    runner = web.AppRunner(make_app(h, **kw), shutdown_timeout=0.5)
-    await runner.setup()
-    await web.UnixSite(runner, str(h.cfg.socket_path)).start()
-    client = Client(h.cfg)
-    try:
-        yield client
-    finally:
-        await client.session.close()
-        await runner.cleanup()
+from whim.provider.fake import ScriptedProvider, finish
+from whim.server import peer_uid
 
 
 async def test_peer_uid_is_read_from_kernel(rig):
@@ -65,73 +49,95 @@ async def test_forged_attribution_fields_are_ignored(rig):
     assert ev["actor"] == "human"
 
 
-async def test_duplicate_client_message_id_is_admitted_once(rig):
+# -- the event stream ------------------------------------------------------------------
+
+
+async def test_rolled_back_savepoint_events_are_not_published(rig):
+    h = await rig.start()
+    q = h.ledger.subscribe()
+    with h.ledger.tx():
+        try:
+            with h.ledger.savepoint():
+                h.ledger.append("host.warning", {"kind": "phantom"})
+                raise ValueError("rejected")
+        except ValueError:
+            pass
+        h.ledger.append("host.warning", {"kind": "real"})
+    live = []
+    while not q.empty():
+        live.append(q.get_nowait())
+    replay = h.ledger.events_after(live[0]["seq"] - 1, 100) if live else []
+    assert [e["data"]["kind"] for e in live] == ["real"]
+    assert live == replay
+
+
+async def test_a_stalled_client_is_disconnected_and_resumes_by_cursor(rig, monkeypatch):
+
+    from whim import ledger as ledger_mod
+
+    monkeypatch.setattr(ledger_mod, "SUBSCRIBER_QUEUE_LIMIT", 4)
+    h = await rig.start()
+    big = "x" * 200_000
+    async with served(h) as c:
+        start = h.ledger.last_seq()
+        reader, writer = await asyncio.open_unix_connection(str(h.cfg.socket_path))
+        writer.write(f"GET /v1/events?after={start} HTTP/1.0\r\nHost: whim\r\n\r\n".encode())
+        await writer.drain()
+        await until(lambda: h.ledger._subscribers)
+        for i in range(40):  # far more than the socket buffers hold; the client reads nothing
+            with h.ledger.tx():
+                h.ledger.append("host.warning", {"i": i, "pad": big})
+            await asyncio.sleep(0)
+        await until(lambda: not h.ledger._subscribers)  # dropped instead of buffering without end
+        raw = b""
+        while chunk := await asyncio.wait_for(reader.read(1 << 20), 5):
+            raw += chunk  # the server closed the connection: read to EOF
+        writer.close()
+        # As an SSE client does: only complete frames (ended by a blank line) count.
+        body = raw.split(b"\r\n\r\n", 1)[1].decode(errors="replace")
+        frames = body.split("\n\n")[:-1]
+        ids = [int(line[3:]) for f in frames for line in f.splitlines() if line.startswith("id:")]
+        last = ids[-1] if ids else start
+        assert last < h.ledger.last_seq()  # it really was cut off
+        rest = [e for _, e in await read_sse(c, f"/v1/events?follow=0&after={last}") if e]
+        assert [e["data"]["i"] for e in rest] == list(range(len(ids), 40))  # nothing lost, nothing repeated
+
+
+async def test_client_reads_events_up_to_the_supported_size(rig):
+
+    from whim import server
+
     h = await rig.start(ScriptedProvider([finish()]))
     async with served(h) as c:
-        a = await c.post("/v1/input", {"text": "hi", "client_message_id": "m1"})
-        b = await c.post("/v1/input", {"text": "hi", "client_message_id": "m1"})
-    await h.wait_idle()
-    assert a["id"] == b["id"] and b["duplicate"] is True
-    assert len(events(h, "input.received")) == 1
-
-
-async def test_sse_replay_and_reconnect_have_no_gaps_or_duplicates(rig):
-    gate = asyncio.Event()
-
-    async def slow_finish(request):
-        await gate.wait()
-        return finish()
-
-    h = await rig.start(ScriptedProvider([
-        call("message_send", destination="human", content="hello"), slow_finish,
-    ]))
-    async with served(h) as c:
-        await c.post("/v1/input", {"text": "hi"})
-        received: list[int] = []
-
-        async def first_connection():
-            async for ev in c.events(0, follow=True):
-                received.append(ev["seq"])
-                if ev["type"] == "delivery.settled":
-                    return  # disconnect mid-run
-
-        await asyncio.wait_for(first_connection(), 5)
-        cursor = received[-1]
-        gate.set()
+        text = "é" * (server.MAX_TEXT_BYTES // 2)  # the largest accepted input
+        status, _ = await c.try_post("/v1/input", {"text": text})
+        assert status == 202
         await h.wait_idle()
-
-        async for ev in c.events(cursor, follow=False):
-            received.append(ev["seq"])
-
-    ledger_seqs = [e["seq"] for e in events(h)]
-    assert received == ledger_seqs  # complete, ordered, no duplicates
-    assert ledger_seqs == list(range(1, len(ledger_seqs) + 1))
+        evs = [e async for e in c.events(0, follow=False)]
+        assert any(e["type"] == "input.received" and e["data"]["text"] == text for e in evs)
+        status, body = await c.try_post("/v1/input", {"text": "x" * (server.MAX_TEXT_BYTES + 1)})
+        assert status == 400 and "error" in body  # refused clearly, never half-accepted
 
 
-async def test_live_follow_receives_events_committed_after_connect(rig):
-    h = await rig.start(ScriptedProvider([call("message_send", destination="human", content="yo"), finish()]))
+async def test_an_oversized_frame_is_reported_and_skipped_not_fatal(rig, monkeypatch):
+
+    from whim import cli
+
+    monkeypatch.setattr(cli, "MAX_EVENT_BYTES", 4096)
+    h = await rig.start(ScriptedProvider([finish(), finish()]))
     async with served(h) as c:
-        cursor = (await c.get("/v1/snapshot"))["cursor"]
-
-        async def wait_for_reply():
-            async for ev in c.events(cursor, follow=True):
-                if ev["type"] == "delivery.settled":
-                    return ev
-
-        task = asyncio.create_task(wait_for_reply())
-        await asyncio.sleep(0.05)
-        await c.post("/v1/input", {"text": "hi"})
-        ev = await asyncio.wait_for(task, 5)
-    assert ev["data"]["content"] == "yo" and ev["audience"] == "human"
+        await c.try_post("/v1/input", {"text": "x" * 10_000})
+        await h.wait_idle()
+        await c.try_post("/v1/input", {"text": "small"})
+        await h.wait_idle()
+        frames = [f async for f in c.frames(0, follow=False)]
+    big = next(seq for seq, ev in frames if ev is cli.OVERSIZED)
+    assert big == next(e["seq"] for e in events(h, "input.received"))  # identified by its seq, cursor moves on
+    assert any(ev is not cli.OVERSIZED and ev and ev["type"] == "input.received"
+               and ev["data"]["text"] == "small" for _, ev in frames)
 
 
-async def test_wake_endpoint_queues_host_wake(rig):
-    h = await rig.start(ScriptedProvider([finish()]))
-    async with served(h) as c:
-        await c.post("/v1/wake", {"text": "look around"})
-    await h.wait_idle()
-    [run] = h.ledger.q("SELECT origin FROM runs")
-    assert json.loads(run["origin"])["kind"] == "host"
+# -- self-management endpoints ---------------------------------------------------------
 
 
 async def test_access_config_and_restart_endpoints(rig, tmp_path, monkeypatch):

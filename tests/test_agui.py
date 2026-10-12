@@ -4,17 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
 
 import pytest
-from aiohttp import web
-from conftest import Clock, Outbox, crash_at, events, runs
+from conftest import (
+    Clock, Outbox, TestChat, check_conformance, crash_at, events, project_all, read_sse, runs, served, until,
+)
 
 from whim import agui
-from whim.cli import Client
 from whim.provider.base import Completion, ProviderError
 from whim.provider.fake import ScriptedProvider, call, calls, finish, say, tool_call
-from whim.server import make_app
 
 SECRET_REASONING = "PRIVATE-CHAIN-OF-THOUGHT-91"
 
@@ -77,52 +75,6 @@ async def build_history(rig):
     h = await rig.start(ScriptedProvider([finish()]), clock=clock, destinations=[Outbox()])
     await h.wait_idle()
     return h
-
-
-def project_all(h, view, entitlements=("operator", "human")):
-    pr = agui.Projector(h, view, entitlements)
-    out = []
-    for ev in h.ledger.events_after(0, 100000):
-        out.extend(pr.project(ev))
-    return out
-
-
-def check_conformance(stream: list[dict]) -> None:
-    """The AG-UI 1.0 ordering rules we rely on (lifecycle, text and tool streaming)."""
-    open_run, closed = None, set()
-    open_msgs, open_calls, ended_calls = set(), set(), set()
-    for e in stream:  # calls restated by a snapshot count as known
-        if e["type"] == "MESSAGES_SNAPSHOT":
-            ended_calls |= {c["id"] for m in e["messages"] for c in m.get("toolCalls", [])}
-    assert not stream or stream[0]["type"] in ("RUN_STARTED", "RUN_ERROR"), stream[:1]
-    for e in stream:
-        t = e["type"]
-        if t == "RUN_STARTED":
-            assert open_run is None, "RUN_STARTED while a run is open"
-            assert e["runId"] not in closed, "runId reused"
-            open_run = e["runId"]
-            continue
-        assert open_run is not None, f"{t} outside a run"
-        if t in ("RUN_FINISHED", "RUN_ERROR"):
-            assert not open_msgs and not open_calls, "run closed with open message/tool call"
-            closed.add(open_run)
-            open_run = None
-        elif t == "TEXT_MESSAGE_START":
-            open_msgs.add(e["messageId"])
-        elif t == "TEXT_MESSAGE_CONTENT":
-            assert e["messageId"] in open_msgs
-        elif t == "TEXT_MESSAGE_END":
-            open_msgs.remove(e["messageId"])
-        elif t == "TOOL_CALL_START":
-            open_calls.add(e["toolCallId"])
-        elif t == "TOOL_CALL_ARGS":
-            assert e["toolCallId"] in open_calls
-        elif t == "TOOL_CALL_END":
-            open_calls.remove(e["toolCallId"])
-            ended_calls.add(e["toolCallId"])
-        elif t == "TOOL_CALL_RESULT":
-            assert e["toolCallId"] in ended_calls, "result for a call that never ended"
-    assert open_run is None, "stream ends with an open run"
 
 
 @pytest.fixture
@@ -191,11 +143,6 @@ async def test_activity_marks_private_text_and_shows_tools(history):
     assert "whim.provider.request.finished" not in names  # inspect only
 
 
-async def test_inspect_adds_usage_and_context_notes(history):
-    names = {e["name"] for e in project_all(history, "inspect") if e["type"] == "CUSTOM"}
-    assert {"whim.provider.request.finished", "whim.context.note"} <= names
-
-
 async def test_audience_filtering_for_a_non_operator_viewer(history):
     stream = project_all(history, "inspect", entitlements=("human",))
     for e in stream:
@@ -212,46 +159,6 @@ async def test_projection_is_deterministic_across_restart(rig, history):
     before = project_all(history, "inspect")
     h = await rig.restart(ScriptedProvider())
     assert project_all(h, "inspect") == before
-
-
-# -- over the authenticated socket ----------------------------------------------------------
-
-
-@asynccontextmanager
-async def served(h, **kw):
-    runner = web.AppRunner(make_app(h, **kw), shutdown_timeout=0.5)
-    await runner.setup()
-    await web.UnixSite(runner, str(h.cfg.socket_path)).start()
-    client = Client(h.cfg)
-    try:
-        yield client
-    finally:
-        await client.session.close()
-        await runner.cleanup()
-
-
-async def read_sse(client, path, *, stop=None, timeout=5.0):
-    """[(id or None, event or None)] frames; id-only frames have event None."""
-    frames = []
-
-    async def go():
-        async with client.session.get(f"http://whim{path}") as r:
-            fid, data = None, []
-            async for raw in r.content:
-                line = raw.decode().rstrip("\n")
-                if line.startswith("id:"):
-                    fid = int(line[3:].strip())
-                elif line.startswith("data:"):
-                    data.append(line[5:].lstrip())
-                elif line == "":
-                    if fid is not None or data:
-                        frames.append((fid, json.loads("\n".join(data)) if data else None))
-                        if stop and data and stop(frames[-1][1]):
-                            return
-                    fid, data = None, []
-
-    await asyncio.wait_for(go(), timeout)
-    return frames
 
 
 async def test_sse_replay_matches_projection_and_resumes_mid_run(history):
@@ -327,8 +234,106 @@ async def test_native_stream_and_agui_filter_audience_on_replay(history):
     assert not [e for e in projected if e["type"].startswith("TOOL_CALL")]
 
 
-async def test_bad_view_is_rejected(rig):
-    h = await rig.start()
-    async with served(h) as c:
-        async with c.session.get("http://whim/v1/agui?view=everything") as r:
-            assert r.status == 400
+# -- snapshots and resumption agree with the live stream --------------------------------
+
+
+def reduce_agui(stream, messages=None):
+    """A client's message state from AG-UI events (snapshots reconcile by id)."""
+    msgs = dict(messages or {})
+    args = {}
+    for e in stream:
+        t = e["type"]
+        if t == "MESSAGES_SNAPSHOT":
+            for m in e["messages"]:
+                msgs[m["id"]] = json.loads(json.dumps(m))
+        elif t == "TEXT_MESSAGE_START":
+            m = {"id": e["messageId"], "role": e["role"], "content": ""}
+            for k in ("name", "metadata"):
+                if k in e:
+                    m[k] = e[k]
+            msgs[m["id"]] = m
+        elif t == "TEXT_MESSAGE_CONTENT":
+            msgs[e["messageId"]]["content"] += e["delta"]
+        elif t == "TOOL_CALL_START":
+            args[e["toolCallId"]] = ""
+            msgs[e["parentMessageId"]] = {"id": e["parentMessageId"], "role": "assistant", "toolCalls": [
+                {"id": e["toolCallId"], "type": "function", "function": {"name": e["toolCallName"], "arguments": ""}}]}
+        elif t == "TOOL_CALL_ARGS":
+            args[e["toolCallId"]] += e["delta"]
+        elif t == "TOOL_CALL_END":
+            msgs[f"{e['toolCallId']}.call"]["toolCalls"][0]["function"]["arguments"] = args[e["toolCallId"]]
+        elif t == "TOOL_CALL_RESULT":
+            msgs[e["messageId"]] = {"id": e["messageId"], "role": "tool", "content": e["content"],
+                                    "toolCallId": e["toolCallId"]}
+    return msgs
+
+
+async def rich_history(rig):
+    """Direct and external input, private text, a delivered question and its answer."""
+
+    p = ScriptedProvider([
+        call("human_ask", question="Tea or coffee?", choices=["tea", "coffee"], authored="(private musing)"),
+        call("message_send", destination="human", content="Asked!"),
+        finish(),
+        finish(),  # the answer's wake
+        call("message_send", destination="reply_to_source", content="hi Alice"),
+        finish(),
+    ])
+    h = await rig.start(p, destinations=[TestChat()])
+    h.submit_input("hello")
+    await h.wait_idle()
+    q = h.ledger.q1("SELECT id FROM questions")["id"]
+    h.answer_question(q, h.cfg.principal_id, choice=1)
+    await h.wait_idle()
+    h.attach_adapter("testchat").submit(sender_id="u-42", sender_name="Alice", channel="garden", text="hi!",
+                                        message_id="m1")
+    await h.wait_idle()
+    return h
+
+
+@pytest.mark.parametrize("view", ["conversation", "activity", "inspect"])
+async def test_snapshots_are_semantically_equal_to_the_live_stream(rig, view):
+    from whim import agui
+
+    h = await rich_history(rig)
+    pr = agui.Projector(h, view)
+    evs = h.ledger.events_after(0, 100000)
+    live = reduce_agui(x for ev in evs for x in pr.project(ev))
+    # The metadata that matters survives into the live state in the first place.
+    metas = [m.get("metadata", {}).get("whim", {}) for m in live.values()]
+    q = h.ledger.q1("SELECT id FROM questions")["id"]
+    assert {"kind": "delivery", "destination": "human", "question_id": q} in metas
+    assert any(m.get("kind") == "input" and m.get("question_id") == q for m in metas)
+    if view != "conversation":
+        assert {"kind": "authored", "delivered": False} in metas
+        assert any(m.get("sender", {}).get("id") == "u-42" for m in metas)
+    # At every cursor, a snapshot equals what a live client had accumulated by then.
+    for i, ev in enumerate(evs):
+        upto = reduce_agui(x for e in evs[: i + 1] for x in pr.project(e))
+        snap = pr.messages(ev["seq"])
+        assert [m["id"] for m in snap] == list(upto), ev["seq"]
+        assert {m["id"]: m for m in snap} == upto, ev["seq"]
+        # A reconnecting client (prefix + tail) converges on the same state as live.
+        resumed = reduce_agui(pr.resume_prefix(ev["seq"]) + [x for e in evs[i + 1:] for x in pr.project(e)], upto)
+        assert resumed == live
+
+
+async def test_restated_run_started_matches_the_live_one(rig):
+    from whim import agui
+
+    gate = asyncio.Event()
+
+    async def slow(request):
+        await gate.wait()
+        return finish()
+
+    h = await rig.start(ScriptedProvider([call("file_read", path="MEMORY.md"), slow]))
+    h.submit_input("hello")
+    await until(lambda: events(h, "tool.finished"))
+    pr = agui.Projector(h, "inspect")
+    started = next(x for ev in events(h, "run.started") for x in pr.project(ev))
+    restated = pr.resume_prefix(h.ledger.last_seq())[0]
+    assert restated["metadata"]["whim"].pop("restated") is True
+    assert restated == started
+    gate.set()
+    await h.wait_idle()

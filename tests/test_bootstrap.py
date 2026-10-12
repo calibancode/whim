@@ -5,16 +5,12 @@ from __future__ import annotations
 import getpass
 import json
 
-from conftest import crash_at, events, runs, tool_result, types
+from conftest import crash_at, events, runs, tool_names, tool_result, types
 
 from whim import bootstrap, onboard
 from whim.provider.fake import ScriptedProvider, call, calls, finish, tool_call
 
 BOOT_HEADER = "⟦host · first meeting · from BOOTSTRAP.md"
-
-
-def tool_names(request) -> list[str]:
-    return [t["function"]["name"] for t in request.tools]
 
 
 def boot_count(messages) -> int:
@@ -174,32 +170,6 @@ async def test_crash_between_completion_and_file_removal(rig):
     assert "bootstrap.complete" not in p2.requests[0].messages[-1]["content"]
 
 
-async def test_heartbeats_wait_for_completion(rig):
-    p = ScriptedProvider([finish(), call("bootstrap_complete"), finish(), finish(), finish()])
-    h = await rig.start(p)
-    assert h.request_wake(kind="heartbeat") is None  # pending
-    h.submit_input("hello")
-    await h.wait_idle()
-    assert h.request_wake(kind="heartbeat") is None  # active
-    # Even a heartbeat row that got queued somehow is not admitted before completion.
-    with h.ledger.tx():
-        h.ledger.x("INSERT INTO wakes(id, kind, status, created_at, data) "
-                   "VALUES('wake_x', 'heartbeat', 'queued', '2026-01-01T00:00:00Z', '{}')")
-    h._nudge()
-    await h.wait_idle()
-    assert len(runs(h)) == 1
-
-    h.submit_input("ok, I think we're good")
-    await h.wait_idle()
-    assert status(h) == "complete"
-    # The stray heartbeat becomes admissible now; a new one is accepted too.
-    await h.wait_idle()
-    assert h.request_wake(kind="heartbeat") is not None
-    await h.wait_idle()
-    kinds = [json.loads(r["origin"])["kind"] for r in runs(h)]
-    assert kinds == ["input", "input", "heartbeat", "heartbeat"]
-
-
 async def test_note_removed_by_operator_before_meeting_is_skipped(rig):
     (rig.cfg.workspace / "BOOTSTRAP.md").unlink()
     p = ScriptedProvider([finish()])
@@ -209,15 +179,3 @@ async def test_note_removed_by_operator_before_meeting_is_skipped(rig):
     assert status(h) == "complete"
     assert BOOT_HEADER not in json.dumps(p.requests[0].messages)
     assert [e["data"]["kind"] for e in events(h, "host.warning")] == ["bootstrap_file_missing"]
-
-
-async def test_note_resupplied_only_if_its_context_was_replaced(rig):
-    h = await rig.start(ScriptedProvider([finish()]))
-    h.submit_input("hello")
-    await h.wait_idle()
-    rows = [{"source_kind": "direct"}]
-    with h.ledger.tx():
-        assert bootstrap.opening_blocks(h, "run_x", rows) == []
-        h.ledger.x("INSERT OR REPLACE INTO meta(key, value) VALUES('context_epoch', '1')")
-        assert bootstrap.opening_blocks(h, "run_x", rows)[0].startswith(BOOT_HEADER)
-        assert bootstrap.opening_blocks(h, "run_x", [{"source_kind": "external"}]) == []

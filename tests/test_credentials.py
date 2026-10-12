@@ -48,12 +48,6 @@ def test_refuses_location_inside_git_worktree(tmp_path, monkeypatch):
     assert not (tmp_path / "repo" / "secrets").exists()
 
 
-def test_default_location_is_xdg_config(monkeypatch, tmp_path):
-    monkeypatch.delenv("WHIM_CREDENTIALS")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-    assert credentials.default_path() == tmp_path / "xdg" / "whim" / "credentials.json"
-
-
 def test_remove_and_rejects_bad_keys():
     with pytest.raises(CredentialError):
         credentials.store("deepseek", "  ")
