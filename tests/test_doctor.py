@@ -118,7 +118,7 @@ def test_live_provider_check_is_opt_in(cfg, monkeypatch):
 
 def test_unit_file(cfg):
     text = service.unit_text(cfg, python="/opt/py/bin/python3")
-    assert f"ExecStart=/opt/py/bin/python3 -m whim --home {cfg.home} run" in text
+    assert f"ExecStart=/opt/py/bin/python3 -P -m whim --home {cfg.home} run" in text
     assert "Restart=on-failure" in text and "RestartPreventExitStatus=75 78" in text
     assert f"TimeoutStopSec={int(cfg.limits.shutdown_grace_seconds) + 15}" in text
     assert "KillMode=mixed" in text and "WantedBy=default.target" in text

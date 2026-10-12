@@ -5,6 +5,8 @@ systemd supervises the process; whim has no watchdog of its own. The unit:
   (so it uses the same owner-only credentials file and the same character state);
 - restarts on failure, but not when another daemon already owns the home (exit 75) or
   the configuration/credentials are unusable (exit 78), which restarting can't fix;
+- runs python with -P, so the working directory (the home folder, under systemd) isn't
+  on the import path, where a file there could shadow one of whim's modules;
 - restarts on EXIT_RESTART (76), which whim uses for its own checked restarts
   (whim.restart); WHIM_SUPERVISOR tells whim it is supervised and may do that;
 - gives a stop request longer than whim's own shutdown grace, so a run in progress can
@@ -36,7 +38,7 @@ def unit_path() -> Path:
 
 def unit_text(cfg: Config, python: str | None = None) -> str:
     python = python or sys.executable
-    exec_start = shlex.join([python, "-m", "whim", "--home", str(cfg.home), "run"])
+    exec_start = shlex.join([python, "-P", "-m", "whim", "--home", str(cfg.home), "run"])
     stop_timeout = int(cfg.limits.shutdown_grace_seconds) + 15
     return f"""[Unit]
 Description=whim character harness ({cfg.home})
