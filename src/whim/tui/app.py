@@ -16,10 +16,12 @@ from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
+from textual.color import Color
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.content import Content
 from textual.geometry import Offset
 from textual.message import Message as TMessage
+from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.selection import Selection
 from textual.widgets import Button, Checkbox, Input, Label, Markdown, Static, TextArea
@@ -204,7 +206,15 @@ class Composer(TextArea):
     Composer:focus { border: round $accent 70%; }
     Composer .text-area--cursor-line { background: transparent; }
     """
-    BINDINGS = [Binding("ctrl+enter,ctrl+g,ctrl+j", "send", "Send", priority=True)]
+    BINDINGS = [Binding("ctrl+enter,ctrl+g,ctrl+j", "send", "Send", priority=True),
+                Binding("ctrl+a", "select_all", "Select all", show=False),
+                # Terminals with the kitty keyboard protocol report these apart from the
+                # unshifted keys, which TextArea alone would ignore.
+                Binding("shift+enter", "newline", show=False),
+                Binding("shift+backspace", "delete_left", show=False)]
+
+    def action_newline(self) -> None:
+        self._replace_via_keyboard("\n", *self.selection)  # as plain enter does
 
     class Submitted(TMessage):
         def __init__(self, text: str):
@@ -226,6 +236,68 @@ class Composer(TextArea):
         # TextArea rewraps on resize but repaints only if its line count changed, which
         # can leave lines wrapped for the old width on screen.
         self.refresh()
+
+
+class Log(Vertical):
+    """The transcript with the jump-to-latest bar laid over it."""
+
+    def on_resize(self) -> None:
+        self.screen.place_unseen()  # type: ignore[attr-defined]
+
+
+class Hints(Chrome):
+    """The row under the composer: key hints, and while the character is awake, a
+    sweeping bar with what it's doing (as OpenCode's footer does)."""
+
+    WIDTH, TRAIL = 8, 3
+    keys: reactive[str] = reactive("")
+
+    def on_mount(self) -> None:
+        self._frame = 0
+        self.set_interval(0.08, self._tick)
+
+    def _tick(self) -> None:
+        if self.working() is not None:
+            self._frame += 1
+            self.refresh()
+
+    def working(self) -> str | None:
+        app: WhimApp = self.app  # type: ignore[assignment]
+        model = app.model
+        if app.link.state != "connected" or not model.active_run or not (run := model.runs.get(model.active_run)):
+            return None
+        busy = [c for c in run.calls.values() if c.status is None]
+        return busy[-1].tool if busy else "thinking"
+
+    def bar(self) -> Text:
+        # Forward then straight back: the head leaves a fading trail behind it.
+        w = self.WIDTH
+        f = self._frame % (2 * (w - 1))
+        head, back = (f, False) if f < w else (2 * (w - 1) - f, True)
+        theme = self.app.current_theme
+        accent, bg = Color.parse(theme.accent or theme.primary), Color.parse(theme.background or "black")
+        out = Text()
+        for i in range(w):
+            d = (i - head) if back else (head - i)
+            if d == 0:
+                out.append("■", style=accent.rich_color.name)
+            elif 0 < d <= self.TRAIL:
+                out.append("■", style=accent.blend(bg, 0.25 * d).rich_color.name)
+            else:
+                out.append("⬝", style="dim")
+        return out
+
+    def render(self) -> RenderableType:
+        width = self.size.width
+        keys = Text(self.keys, no_wrap=True)
+        doing = self.working()
+        if doing is None:
+            return keys
+        left = self.bar()
+        left.append(f" {doing}…", style="italic")
+        if left.cell_len + 2 + keys.cell_len > width:
+            return left
+        return Text.assemble(left, " " * (width - left.cell_len - keys.cell_len), keys)
 
 
 class Inspector(VerticalScroll):
@@ -315,7 +387,9 @@ class ChatScreen(ResponsiveScreen):
     ChatScreen { layout: vertical; }
     ChatScreen #body { height: 1fr; }
     ChatScreen #convo { width: 1fr; height: 1fr; }
-    ChatScreen #unseen { height: 1; display: none; text-align: center; background: $accent 30%; }
+    ChatScreen #log { height: 1fr; layers: base overlay; }
+    ChatScreen #unseen { layer: overlay; position: absolute; width: auto; height: 1; padding: 0 1; display: none;
+                         background: $accent 30%; }
     ChatScreen #hints { height: 1; padding: 0 1; color: $text-muted; }
     ChatScreen.wide.inspector #inspector { display: block; }
     ChatScreen.short #hints { display: none; }
@@ -328,7 +402,7 @@ class ChatScreen(ResponsiveScreen):
         Binding("ctrl+end,ctrl+l", "latest", "Latest", show=False, priority=True),
         Binding("ctrl+up", "segment(-1)", "Previous activity", show=False, priority=True),
         Binding("ctrl+down", "segment(1)", "Next activity", show=False, priority=True),
-        Binding("escape", "composer", "Back to the composer", show=False, priority=True),
+        Binding("escape", "composer", "Latest message", show=False, priority=True),
         Binding("ctrl+g", "send", "Send", show=False, priority=True),
         Binding("ctrl+b", "app.inspector", "Inspector", show=False),
         Binding("ctrl+o", "app.attention", "Review", show=False),
@@ -339,14 +413,15 @@ class ChatScreen(ResponsiveScreen):
         yield StatusBar(id="status")
         with Horizontal(id="body"):
             with Vertical(id="convo"):
-                yield Transcript(app.model, lambda: app.char_name, id="transcript")
-                yield Chrome(id="unseen")
+                with Log(id="log"):
+                    yield Transcript(app.model, lambda: app.char_name, id="transcript")
+                    yield Chrome(id="unseen")  # over the transcript's bottom padding, right-aligned
                 yield AttentionBar(id="attention")
                 draft = app.store.data.get("draft") or {}
                 composer = Composer(draft.get("text", ""), id="composer", soft_wrap=True, show_line_numbers=False,
                                     tab_behavior="focus", placeholder="Write a message…")
                 yield composer
-                yield Chrome(id="hints")
+                yield Hints(id="hints")
             yield Inspector(id="inspector")
 
     def on_mount(self) -> None:
@@ -377,7 +452,7 @@ class ChatScreen(ResponsiveScreen):
             s = "ctrl+g send  ·  f2–f6 views  ·  ctrl+p commands  ·  f1 help  ·  ctrl+q quit"
         else:
             s = "ctrl+g send · ctrl+p · f1 help"
-        self.query_one("#hints", Chrome).update(s)
+        self.query_one(Hints).keys = s
 
     @property
     def transcript(self) -> Transcript:
@@ -394,7 +469,11 @@ class ChatScreen(ResponsiveScreen):
         self.transcript.focus_segments(step)
 
     def action_composer(self) -> None:
-        self.clear_selection()
+        """Escape: clear a selection where it is; otherwise go to the latest message."""
+        if self.selections:
+            self.clear_selection()
+        elif not self.transcript.following or self.transcript.unseen:
+            self.transcript.jump_to_end()
         self.query_one(Composer).focus()
 
     def action_send(self) -> None:
@@ -413,8 +492,18 @@ class ChatScreen(ResponsiveScreen):
     @on(Transcript.Unseen)
     def unseen(self, event: Transcript.Unseen) -> None:
         bar = self.query_one("#unseen", Chrome)
-        bar.display = event.count > 0
-        bar.update(f"↓ {event.count} new message{'s' * (event.count != 1)} · ctrl+end to jump")
+        bar.display = event.away or event.count > 0
+        if event.count:
+            bar.update(f"↓ {event.count} new message{'s' * (event.count != 1)} · esc to jump")
+        else:
+            bar.update("↓ jump to latest · esc")
+        self.place_unseen()
+
+    def place_unseen(self) -> None:
+        bar, log = self.query_one("#unseen", Chrome), self.query_one("#log")
+        # Its own size isn't known until it has been laid out; its text's width is.
+        width = Text(str(bar.render())).cell_len + 2
+        bar.styles.offset = (max(0, log.size.width - width - 3), max(0, log.size.height - 1))
 
     def on_click(self, event: events.Click) -> None:
         if event.widget is not None and event.widget.id == "unseen":
@@ -586,11 +675,10 @@ HELP_KEYS = [
     ("ctrl+g", "send (also ctrl+enter, where the terminal reports it)"),
     ("enter", "new line"),
     ("ctrl+z / ctrl+y", "undo / redo"),
-    ("shift+arrows", "select; ctrl+x / ctrl+c cut and copy, paste with the terminal's paste"),
+    ("shift+arrows", "select (ctrl+a: everything); ctrl+x / ctrl+c cut and copy, paste with the terminal's paste"),
     ("pgup / pgdn", "scroll the conversation"),
-    ("ctrl+end", "jump to the latest message and follow it again"),
+    ("escape · ctrl+end", "jump to the latest message and follow it again"),
     ("ctrl+↑ / ctrl+↓", "move between activity entries; enter expands one"),
-    ("escape", "back to the composer"),
     ("ctrl+o", "review what the character is waiting on: approvals, questions"),
     ("ctrl+b", "inspector (wide terminals; otherwise the schedule view)"),
     ("Selecting text", None),
@@ -746,6 +834,7 @@ class WhimApp(App):
         if not self.is_mounted or not hasattr(self, "chat") or not self.chat.is_mounted:
             return
         self.chat.query_one(StatusBar).refresh()
+        self.chat.query_one(Hints).refresh()
         self.chat.query_one(AttentionBar).show(self.model.approvals, self.model.questions)
         self.chat.query_one(Inspector).update_from(self)
 

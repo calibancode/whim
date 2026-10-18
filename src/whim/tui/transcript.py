@@ -266,11 +266,13 @@ class Transcript(VerticalScroll, can_focus=True):
     """
 
     class Unseen(TMessage):
-        """The count of messages that arrived while the user was reading history changed."""
+        """The view left or returned to the end, or the count of messages that arrived
+        while the user was reading history changed."""
 
-        def __init__(self, count: int):
+        def __init__(self, count: int, away: bool):
             super().__init__()
             self.count = count
+            self.away = away
 
     def __init__(self, model: Model, name_of: Callable[[], str], **kw):
         super().__init__(**kw)
@@ -279,13 +281,26 @@ class Transcript(VerticalScroll, can_focus=True):
         self.views: dict[str, ItemView] = {}
         self.expanded: set[str] = set()
         self.start = 0  # model.items index of the first item that may be mounted
-        self.following = True
+        self._following = True
         self.unseen = 0
         self._anchor: tuple[Widget, float] | None = None
         self._anchor_size: Size | None = None
         self._loading_earlier = False
         self._settling = False
         self._held = False  # text in the transcript is selected: don't follow
+
+    @property
+    def following(self) -> bool:
+        return self._following
+
+    @following.setter
+    def following(self, value: bool) -> None:
+        if value != self._following:
+            self._following = value
+            self._report()
+
+    def _report(self) -> None:
+        self.post_message(self.Unseen(self.unseen, away=not self._following))
 
     def compose(self):
         yield Static("loading history…", id="transcript-top")
@@ -361,7 +376,7 @@ class Transcript(VerticalScroll, can_focus=True):
             self._set_top()
         if (not self.following or self._held) and new_messages:
             self.unseen += new_messages
-            self.post_message(self.Unseen(self.unseen))
+            self._report()
 
     def _index(self, item: Item) -> int:
         i = getattr(item, "_index", None)
@@ -408,7 +423,7 @@ class Transcript(VerticalScroll, can_focus=True):
         self.call_after_refresh(self._settle)  # again once anything just mounted is laid out
         if self.unseen:
             self.unseen = 0
-            self.post_message(self.Unseen(0))
+            self._report()
 
     def _trim(self) -> None:
         """Back at the end after reading far back: unmount the oldest views again, so
@@ -460,7 +475,7 @@ class Transcript(VerticalScroll, can_focus=True):
                 self.call_after_refresh(self._trim)
             if at_end and self.unseen:
                 self.unseen = 0
-                self.post_message(self.Unseen(0))
+                self._report()
         self._capture()
         if new <= 1 and old > new and self.start > 0:
             self.load_earlier()

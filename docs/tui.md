@@ -28,12 +28,15 @@ nothing into the whim home: its draft and any unconfirmed messages are kept in
   heartbeat`. A heartbeat that only looked around and did nothing stays out of the
   conversation; it is listed under Schedule and Activity.
 - **Scrolling.** The view follows new messages only while you're at the bottom. If you
-  have scrolled back, nothing moves; a `↓ N new messages` bar appears, and ctrl+end
-  returns you to the end and resumes following. On resize, text rewraps and the message
+  have scrolled back, nothing moves; a `↓ jump to latest` bar appears (`↓ N new
+  messages` once any arrive), and **escape** or ctrl+end returns you to the end and
+  resumes following. With text selected, the first escape only clears the selection. On resize, text rewraps and the message
   you were reading stays at the top. Older history loads as you scroll up.
 - **Status line.** Connection (green dot: connected), whether the character is
   resting or awake (and what it did last), anything waiting on you, and the next
   heartbeat.
+- **While it's awake**, a sweeping bar under the composer shows that it's working:
+  `thinking…` while the model is writing, or the tool it's running.
 
 ## Selecting and copying
 
@@ -65,9 +68,9 @@ terminals, and in tmux).
 
 The composer is a multiline editor. Enter starts a new line, and **ctrl+g** sends.
 ctrl+enter also sends in terminals that report it (those with the kitty keyboard
-protocol). Undo and redo are ctrl+z and ctrl+y; select with shift+arrows; cut and copy
-are ctrl+x and ctrl+c; paste with your terminal's paste, or ctrl+v for what was copied
-in the TUI. The composer grows up to a limit, then scrolls.
+protocol). Undo and redo are ctrl+z and ctrl+y; select with shift+arrows, or all of it
+with ctrl+a; cut and copy are ctrl+x and ctrl+c; paste with your terminal's paste, or
+ctrl+v for what was copied in the TUI. The composer grows up to a limit, then scrolls.
 
 **Sending is exactly-once.** A message is shown at once with its state: `sending…`,
 then confirmed. If whim isn't reachable it stays `waiting for whim` and is sent when it
